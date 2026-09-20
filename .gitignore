@@ -1,0 +1,27 @@
+# 密钥与运行时数据 —— 绝不能提交
+# ⚠️ git 不会把同行的 # 当成分隔符，整行会被当成注释跳过；
+#    所以说明写在上面、规则单独一行。改完一定要跑
+#    `git check-ignore -v config.json data/secret` 确认 exit=0。
+
+# 里面存着 HA 的长期访问令牌
+config.json
+
+# HMAC 密钥、待决快照、审计日志
+data/
+
+*.secret
+*.token
+*.log
+
+# 备份文件
+*.bak
+*.bak-*
+*.orig
+
+# 依赖与缓存
+node_modules/
+.DS_Store
+
+# 宿主工具的本机会话/记忆/产物 —— 与本仓库无关，也不应外传
+.workbuddy/
+dist/

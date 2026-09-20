@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent 确认 · 手机模拟器</title>
+<style>
+  :root{
+    --bg:#0b0f14; --card:#141a22; --card2:#1b232d; --line:#243040;
+    --fg:#e6edf3; --muted:#8b97a6; --accent:#00D4FF;
+    --l2:#EF9F27; --l3:#F09595; --ok:#5DCAA5;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB",sans-serif;
+    padding:20px 16px 60px;max-width:620px;margin:0 auto}
+  h1{font-size:17px;font-weight:600;margin:0 0 4px}
+  .sub{color:var(--muted);font-size:12px;margin-bottom:18px;line-height:1.6}
+  .bar{display:flex;gap:8px;align-items:center;margin-bottom:16px;flex-wrap:wrap}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--muted);flex:0 0 auto}
+  .dot.on{background:var(--ok)}
+  .meta{font-size:12px;color:var(--muted)}
+  button{font-family:inherit;font-size:13px;cursor:pointer;border-radius:9px;
+    border:1px solid var(--line);background:var(--card2);color:var(--fg);
+    padding:12px 14px;min-height:44px;transition:.12s}
+  button:hover{border-color:var(--accent);color:var(--accent)}
+  button.primary{border-color:var(--accent);background:rgba(0,212,255,.12);color:var(--accent)}
+  button.deny{border-color:#3a2a2a;background:rgba(240,149,149,.08);color:var(--l3)}
+  button:disabled{opacity:.45;cursor:default}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+    padding:16px;margin-bottom:12px}
+  /* 从通知点进来时那一条的外框 —— 让人一眼看到该点哪个 */
+  .card.focus{border-color:var(--accent);
+    box-shadow:0 0 0 1px var(--accent),0 0 18px rgba(0,212,255,.18)}
+  .tier{display:inline-block;font-size:11px;padding:2px 8px;border-radius:6px;
+    border:1px solid;margin-bottom:10px}
+  .tier.L2{color:var(--l2);border-color:rgba(239,159,39,.4);background:rgba(239,159,39,.1)}
+  .tier.L3{color:var(--l3);border-color:rgba(240,149,149,.4);background:rgba(240,149,149,.1)}
+  .ttl{font-size:15px;font-weight:600;margin:0 0 6px;line-height:1.45}
+  .bd{font-size:13px;color:var(--muted);margin:0 0 12px;line-height:1.6;
+    word-break:break-all;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .acts{display:flex;gap:8px;flex-wrap:wrap}
+  .acts button{flex:1 1 auto;min-width:92px}
+  .lock{font-size:11px;color:var(--l3);margin-top:10px}
+  .empty{color:var(--muted);font-size:13px;padding:28px 0;text-align:center}
+  .hint{background:var(--card);border:1px solid var(--line);border-radius:12px;
+    padding:14px;font-size:12px;color:var(--muted);line-height:1.7;margin-top:22px}
+  .hint code{color:var(--accent);font-size:11px}
+  h2{font-size:13px;font-weight:600;color:var(--muted);margin:26px 0 10px;
+    text-transform:none;letter-spacing:.02em}
+  .log{font-size:12px;color:var(--muted);line-height:1.75;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .log b{color:var(--fg);font-weight:500}
+  .toast{position:sticky;top:0;z-index:5;margin:0 0 12px;padding:10px 14px;
+    border-radius:10px;font-size:12px;background:var(--card2);
+    border:1px solid var(--line);display:none}
+  .toast.show{display:block}
+</style>
+</head>
+<body>
+<h1>Agent 确认 · 手机模拟器</h1>
+<div class="sub">
+  这个页面扮演你的 iPhone。它拿到的是推送里同一串一次性令牌，
+  所以这里的每一次点击都走完整的验签 + nonce + 动作哈希校验链路 ——
+  用它可以在没有 Home Assistant 的情况下验证方案是否成立。
+</div>
+
+<div class="toast" id="toast"></div>
+
+<div class="bar">
+  <span class="dot" id="dot"></span>
+  <span class="meta" id="status">连接中…</span>
+  <button id="mk" style="margin-left:auto;padding:8px 12px;min-height:36px;font-size:12px">造一条测试确认</button>
+</div>
+
+<div id="list"><div class="empty">暂无待确认项</div></div>
+
+<h2>最近的决策</h2>
+<div class="log" id="audit">—</div>
+
+<div class="hint">
+  <b style="color:var(--fg)">接真实手机的方式</b><br>
+  把 <code>config.json</code> 的 <code>channel</code> 换成 <code>ha</code>，
+  通知会推到你的 iPhone 并在 Apple Watch 上镜像。手表按钮触发的是
+  <code>mobile_app_notification_action</code> 事件，由网关通过 WebSocket 收回，
+  所以 Mac 不需要任何公网入口。
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let inflight = new Set();
+
+// 通知里的 url 形如 /phone.html?focus=<approvalId>。
+// 带上它就把那条置顶高亮 —— 从通知点进来的人只想看到「要我确认的那一条」，
+// 不该让他在整个列表里自己找。
+const focusId = new URLSearchParams(location.search).get('focus');
+let focusScrolled = false;
+
+function toast(msg, kind) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.style.borderColor = kind === 'bad' ? 'var(--l3)' : 'var(--ok)';
+  t.style.color = kind === 'bad' ? 'var(--l3)' : 'var(--ok)';
+  t.classList.add('show');
+  clearTimeout(window.__tt);
+  window.__tt = setTimeout(() => t.classList.remove('show'), 3200);
+}
+
+async function decide(actionId, label) {
+  if (inflight.has(actionId)) return;
+  inflight.add(actionId);
+  try {
+    const r = await fetch('/v1/decision', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: actionId, channel: 'phone-sim', deviceName: 'iPhone 模拟器' }),
+    });
+    const j = await r.json();
+    toast(j.ok ? `已提交「${label}」：${j.verdict === 'allow' ? '放行' : '拒绝'}` : `被拒绝：${j.message}`,
+      j.ok ? 'ok' : 'bad');
+  } catch (e) {
+    toast('提交失败：' + e.message, 'bad');
+  } finally {
+    inflight.delete(actionId);
+    render();
+  }
+}
+
+function renderCard(item) {
+  const el = document.createElement('div');
+  el.className = 'card' + (focusId && item.id === focusId ? ' focus' : '');
+  const secs = Math.round(item.remainingMs / 1000);
+  el.innerHTML =
+    `<span class="tier ${item.tier}">${item.tier}</span>` +
+    `<p class="ttl">${esc(item.title)}</p>` +
+    `<p class="bd">${esc(item.body)}</p>` +
+    `<div class="acts"></div>` +
+    (item.tier === 'L3' ? '<div class="lock">L3 需要设备解锁后按钮才可用</div>' : '') +
+    `<div class="meta" style="margin-top:10px">剩余 ${secs}s · ${item.id}</div>`;
+
+  const acts = el.querySelector('.acts');
+  item.options.forEach((o) => {
+    const b = document.createElement('button');
+    b.textContent = o.label;
+    if (o.id.startsWith('deny')) b.className = 'deny';
+    else if (o.id.startsWith('approve') && item.tier === 'L3') b.className = 'primary';
+    b.onclick = () => { el.querySelectorAll('button').forEach((x) => { x.disabled = true; }); decide(o.actionId, o.label); };
+    acts.appendChild(b);
+  });
+  return el;
+}
+
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+async function render() {
+  try {
+    const [h, a, au] = await Promise.all([
+      fetch('/healthz').then((r) => r.json()),
+      fetch('/v1/approvals?status=pending').then((r) => r.json()),
+      fetch('/v1/audit?limit=12').then((r) => r.json()),
+    ]);
+    $('dot').classList.add('on');
+    $('status').textContent = `通道 ${h.channel}${h.channelReady ? '（已就绪）' : '（未就绪）'} · ${h.pending} 项待确认`;
+
+    const list = $('list');
+    list.innerHTML = '';
+    // 置顶：把 focus 那条排到最前。sort 用布尔差，稳定且不动其余顺序。
+    const items = (a.items || []).slice();
+    if (focusId) items.sort((x, y) => (y.id === focusId) - (x.id === focusId));
+
+    // 判据是「focus 那条在不在列表里」，**不是**「列表空不空」。
+    // 踩过：只在空列表时提示的话，那条被处理掉、同时又有新的待确认项进来时，
+    // 点通知的人会看到一个完全正常的列表，压根不知道自己要找的那条怎么了。
+    const focusMissing = focusId && !items.some((i) => i.id === focusId);
+    if (focusMissing) {
+      const note = document.createElement('div');
+      note.className = 'empty';
+      note.style.textAlign = 'left';
+      note.textContent = '你要确认的那一条已经处理过了（已决策 / 已过期）。'
+        + (items.length ? '下面是其余的待确认项。' : '');
+      list.appendChild(note);
+    }
+
+    if (!items.length) {
+      if (!focusMissing) list.innerHTML = '<div class="empty">暂无待确认项</div>';
+    } else {
+      items.forEach((i) => list.appendChild(renderCard(i)));
+      // focus 正常命中时才滚动 —— 提示条已经出现在顶部，滚下去反而把它推出视野
+      if (!focusMissing && !focusScrolled) {
+        const el = list.querySelector('.card.focus');
+        if (el) { el.scrollIntoView({ block: 'center' }); focusScrolled = true; }
+      }
+    }
+
+    $('audit').innerHTML = (au.items || []).map((x) => {
+      const t = new Date(x.ts).toLocaleTimeString('zh-CN');
+      if (x.event === 'settled') {
+        return `${t} <b>${x.verdict === 'allow' ? '放行' : '拒绝'}</b> ${x.tier} ${x.optionId} ` +
+          `· ${Math.round((x.latencyMs || 0) / 100) / 10}s · ${x.source || ''}`;
+      }
+      if (x.event === 'created') return `${t} 发起 ${x.tier} ${x.tool} · ${x.channel}`;
+      if (x.event === 'rejected') return `${t} <b>已拦截</b> ${x.reason}（${x.id}）`;
+      if (x.event === 'timeout_default') return `${t} 超时按默认拒绝 ${x.tier}（${x.id}）`;
+      if (x.event === 'push_failed') return `${t} 推送失败：${x.error}`;
+      return `${t} ${x.event}`;
+    }).join('<br>') || '—';
+  } catch (e) {
+    $('dot').classList.remove('on');
+    $('status').textContent = '网关未响应：' + e.message;
+  }
+}
+
+$('mk').onclick = async () => {
+  await fetch('/v1/approvals', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      tool: 'Bash',
+      tool_input: { command: 'git push --force origin main' },
+      ttl: 90,
+      requester: 'phone-sim-demo',
+    }),
+  });
+  render();
+};
+
+render();
+setInterval(render, 1500);
+</script>
+</body>
+</html>

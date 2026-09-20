@@ -1,0 +1,42 @@
+{
+  "port": 7788,
+  "host": "127.0.0.1",
+  "dataDir": "./data",
+  "channel": "mock",
+  "sharedSecret": "CHANGE_ME_run_node_gen-secret_to_make_one",
+  "defaults": {
+    "ttlSeconds": {
+      "L2": 300,
+      "L3": 120
+    },
+    "defaultOptionId": "deny",
+    "sessionAllowTtlSeconds": 1800,
+    "unknownToolTier": "L1",
+    "unmatchedBashTier": "L2"
+  },
+  "channels": {
+    "mock": {},
+    "ha": {
+      "baseUrl": "http://localhost:8123",
+      "token": "PASTE_HOME_ASSISTANT_LONG_LIVED_TOKEN",
+      "notifyService": "mobile_app_your_iphone",
+      "timeSensitiveFromTier": "L2",
+      "criticalFromTier": "L3",
+      "clearAfterDecision": true,
+      "publicBaseUrl": "",
+      "phoneAccessKey": ""
+    },
+    "pushcut": {
+      "webhookUrl": "https://api.pushcut.io/XXXX/notifications/Agent",
+      "callbackBase": "http://127.0.0.1:7788"
+    }
+  },
+  "risk": {
+    "extraL3Patterns": [],
+    "extraL2Patterns": [],
+    "extraL0Patterns": [],
+    "forceTierByTool": {
+      "mcp__agent-mail__SendMessage": "L2"
+    }
+  }
+}
