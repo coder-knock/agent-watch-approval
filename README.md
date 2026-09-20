@@ -4,6 +4,8 @@
 
 把 Agent 运行中需要拍板的选项推到 iPhone / Apple Watch，腕上决策后回传给 Agent。
 
+> [English (this file)](./README.md) · [中文](./README.zh-CN.md)
+
 ---
 
 ## What this is
@@ -57,7 +59,7 @@ node test/local-grant.test.mjs # 66 local-confirm state machine
 node test/device-readiness.test.mjs  # 45 device-readiness
 node test/store-resilience.test.mjs  # 26 storage fault-tolerance
 node test/net-doctor.test.mjs        # 35 net-drift detection
-# Total: 439 passing
+# Total: 454 passing
 ```
 
 ## Links
@@ -91,7 +93,7 @@ bin/
 mcp/approval-mcp.mjs       # MCP server exposing /v1/approvals
 public/phone.html          # browser-as-iPhone simulator
 scripts/                   # install, repair, doctor, netwatch
-test/                      # 8 suites, 439 tests
+test/                      # 8 suites, 454 tests
 ```
 
 ## License
