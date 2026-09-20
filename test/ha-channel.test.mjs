@@ -25,15 +25,24 @@ function check(name, cond, detail = '') {
   }
 }
 
-/** 拦住 fetch，把每次调用记下来，返回一个可控的响应。 */
+/** 拦住 fetch，把每次调用记下来，返回一个可控的响应。
+ *
+ * 默认让 `/api/states` 返回一个空数组（合法 JSON），让 readiness 探测走到
+ * "判不了"分支而不是报错 —— push() 仍会照常发。其它端点返回 text 默认值。
+ */
 function stubFetch({ ok = true, status = 200, text = '' } = {}) {
   const calls = [];
   globalThis.fetch = async (url, init = {}) => {
     calls.push({ url: String(url), init, body: init.body ? JSON.parse(init.body) : null });
-    return { ok, status, text: async () => text };
+    const u = String(url);
+    const bodyText = u.includes('/api/states') ? '[]' : text;
+    return { ok, status, text: async () => bodyText };
   };
   return calls;
 }
+
+/** 取「对 /api/services/ 的那次调用」—— readiness 探测可能在前面。 */
+const serviceCall = (calls) => calls.find((c) => c.url.includes('/api/services/')) ?? null;
 
 const record = {
   id: 'muTEST0001',
@@ -59,7 +68,7 @@ console.log('\n[1] REST 路径必须是斜杠分隔');
 {
   const calls = stubFetch();
   await mk().push(record);
-  const url = calls[0]?.url ?? '';
+  const url = serviceCall(calls)?.url ?? '';
   check(
     'push 走 /api/services/notify/<服务名>（斜杠）',
     url === 'http://ha.test:8123/api/services/notify/mobile_app_demo',
@@ -74,19 +83,20 @@ console.log('\n[1] REST 路径必须是斜杠分隔');
   await mk({ baseUrl: 'http://ha.test:8123/' }).push(record);
   check(
     'baseUrl 带尾斜杠也能正确拼接',
-    calls[0]?.url === 'http://ha.test:8123/api/services/notify/mobile_app_demo',
-    `实际 ${calls[0]?.url}`
+    serviceCall(calls)?.url === 'http://ha.test:8123/api/services/notify/mobile_app_demo',
+    `实际 ${serviceCall(calls)?.url}`
   );
 }
 
 {
   const calls = stubFetch();
   await mk().clear(record);
-  const url = calls[0]?.url ?? '';
+  const c = serviceCall(calls);
+  const url = c?.url ?? '';
   check('clear 也走斜杠路径', url.endsWith('/api/services/notify/mobile_app_demo'), `实际 ${url}`);
   check('clear 的报文是 clear_notification + 同一个 tag',
-    calls[0]?.body?.message === 'clear_notification' && calls[0]?.body?.data?.tag === 'apr_muTEST0001',
-    JSON.stringify(calls[0]?.body));
+    c?.body?.message === 'clear_notification' && c?.body?.data?.tag === 'apr_muTEST0001',
+    JSON.stringify(c?.body));
 }
 
 {
@@ -101,8 +111,9 @@ console.log('\n[2] 通知报文形状');
 {
   const calls = stubFetch();
   await mk().push(record);
-  const b = calls[0].body;
-  check('带 Authorization 头', calls[0].init.headers.Authorization === 'Bearer tok');
+  const svc = serviceCall(calls);
+  const b = svc.body;
+  check('带 Authorization 头', svc.init.headers.Authorization === 'Bearer tok');
   check('title 取自记录', b.title === record.title);
   check(
     '正文 = 原文 + 长按展开提示',
@@ -162,10 +173,10 @@ console.log('\n[2b] 长按展开提示');
       { id: 'detail', label: '查看详情', verdict: 'defer', informative: true, actionId: 'APR:x:detail:5:6' },
     ],
   });
-  const acts = calls[0].body.data.actions;
+  const acts = serviceCall(calls).body.data.actions;
   check('「查看详情」用 info 图标', acts[2].icon === 'sfsymbols:info.circle', JSON.stringify(acts.map((x) => x.icon)));
   check('三个按钮的图标互不相同', new Set(acts.map((x) => x.icon)).size === 3, JSON.stringify(acts.map((x) => x.icon)));
-  check('L3 正文也带长按提示', calls[0].body.message.includes('长按这张卡片'));
+  check('L3 正文也带长按提示', serviceCall(calls).body.message.includes('长按这张卡片'));
 }
 
 // ── 2c. 点通知直达审批页（url） ────────────────────────────────────────────
@@ -178,32 +189,36 @@ console.log('\n[2c] 点通知直达审批页');
 {
   const c0 = stubFetch();
   await mk().push(record);
+  const s0 = serviceCall(c0);
   check(
     '未配 publicBaseUrl 时不写 url（避免死链）',
-    !('url' in c0[0].body.data),
-    JSON.stringify(Object.keys(c0[0].body.data))
+    !('url' in s0.body.data),
+    JSON.stringify(Object.keys(s0.body.data))
   );
 
   const c1 = stubFetch();
   await mk({ publicBaseUrl: 'http://192.168.1.5:7788' }).push(record);
+  const s1 = serviceCall(c1);
   check(
     '配了就写 url，并带 focus=<id> 让页面自动置顶',
-    c1[0].body.data.url === 'http://192.168.1.5:7788/phone.html?focus=muTEST0001',
-    c1[0].body.data.url
+    s1.body.data.url === 'http://192.168.1.5:7788/phone.html?focus=muTEST0001',
+    s1.body.data.url
   );
-  check('url 挂在 data 下（不是顶层）', !('url' in c1[0].body), JSON.stringify(Object.keys(c1[0].body)));
+  check('url 挂在 data 下（不是顶层）', !('url' in s1.body), JSON.stringify(Object.keys(s1.body)));
 
   const c2 = stubFetch();
   await mk({ publicBaseUrl: 'http://192.168.1.5:7788/' }).push(record);
+  const s2 = serviceCall(c2);
   check(
     'publicBaseUrl 尾斜杠不会拼出双斜杠',
-    c2[0].body.data.url === 'http://192.168.1.5:7788/phone.html?focus=muTEST0001',
-    c2[0].body.data.url
+    s2.body.data.url === 'http://192.168.1.5:7788/phone.html?focus=muTEST0001',
+    s2.body.data.url
   );
 
   const c3 = stubFetch();
   await mk({ publicBaseUrl: 'http://192.168.1.5:7788', phoneAccessKey: 's3cret' }).push(record);
-  check('配了口令就带上 k=', c3[0].body.data.url.endsWith('&k=s3cret'), c3[0].body.data.url);
+  const s3 = serviceCall(c3);
+  check('配了口令就带上 k=', s3.body.data.url.endsWith('&k=s3cret'), s3.body.data.url);
 }
 
 // ── 3. 分级 → 提醒强度 ─────────────────────────────────────────────────────
@@ -214,32 +229,36 @@ console.log('\n[3] 分级决定打断强度');
 {
   const calls = stubFetch();
   await mk().push({ ...record, tier: 'L1' });
-  check('L1 不设 interruption-level', calls[0].body.data.push['interruption-level'] === undefined,
-    JSON.stringify(calls[0].body.data.push));
-  check('L1 用普通声音', calls[0].body.data.push.sound.critical === undefined);
+  const s = serviceCall(calls);
+  check('L1 不设 interruption-level', s.body.data.push['interruption-level'] === undefined,
+    JSON.stringify(s.body.data.push));
+  check('L1 用普通声音', s.body.data.push.sound.critical === undefined);
 }
 
 {
   const calls = stubFetch();
   await mk().push({ ...record, tier: 'L2' });
+  const s = serviceCall(calls);
   check('L2（timeSensitiveFromTier 默认值）→ time-sensitive',
-    calls[0].body.data.push['interruption-level'] === 'time-sensitive',
-    JSON.stringify(calls[0].body.data.push));
+    s.body.data.push['interruption-level'] === 'time-sensitive',
+    JSON.stringify(s.body.data.push));
 }
 
 {
   // 出厂推荐配置就是 criticalFromTier: "L3"
   const calls = stubFetch();
   await mk({ criticalFromTier: 'L3' }).push({ ...record, tier: 'L2' });
+  const s = serviceCall(calls);
   check('criticalFromTier=L3 时，L2 仍只是 time-sensitive',
-    calls[0].body.data.push['interruption-level'] === 'time-sensitive');
+    s.body.data.push['interruption-level'] === 'time-sensitive');
 }
 
 {
   const calls = stubFetch();
   await mk({ criticalFromTier: 'L3' }).push({ ...record, tier: 'L3' });
-  const p = calls[0].body.data.push;
-  const a = calls[0].body.data.actions;
+  const s = serviceCall(calls);
+  const p = s.body.data.push;
+  const a = s.body.data.actions;
   check('criticalFromTier=L3 时，L3 → critical 级别', p['interruption-level'] === 'critical', JSON.stringify(p));
   check('L3 → 临界音量声音', p.sound.critical === 1 && p.sound.volume === 1, JSON.stringify(p.sound));
   check('L3 → 每个按钮都要求解锁', a.every((x) => x.authenticationRequired === true), JSON.stringify(a));
@@ -249,18 +268,20 @@ console.log('\n[3] 分级决定打断强度');
   // null = 明确表示「不要用 critical」，必须真的关掉 —— 否则配置在撒谎
   const calls = stubFetch();
   await mk({ criticalFromTier: null }).push({ ...record, tier: 'L3' });
-  const p = calls[0].body.data.push;
+  const s = serviceCall(calls);
+  const p = s.body.data.push;
   check('criticalFromTier=null 时 L3 退回 time-sensitive', p['interruption-level'] === 'time-sensitive', JSON.stringify(p));
   check('criticalFromTier=null 时 L3 也用普通声音', p.sound.critical === undefined, JSON.stringify(p.sound));
   check('关掉 critical 不影响按钮仍要求解锁',
-    calls[0].body.data.actions.every((x) => x.authenticationRequired === true));
+    s.body.data.actions.every((x) => x.authenticationRequired === true));
 }
 
 {
   const calls = stubFetch();
   await mk().push({ ...record, tier: 'L1', options: [{ id: 'ok', label: '知道了', actionId: 'APR:x', requireUnlock: true }] });
+  const s = serviceCall(calls);
   check('选项自带 requireUnlock 时也会要求解锁',
-    calls[0].body.data.actions[0].authenticationRequired === true);
+    s.body.data.actions[0].authenticationRequired === true);
 }
 
 // ── 4. 失败要抛错，且错误里带得上服务名 ───────────────────────────────────

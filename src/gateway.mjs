@@ -169,6 +169,50 @@ function handleIncomingAction(actionRaw, meta = {}) {
 }
 
 // ── 创建确认 ────────────────────────────────────────────────────────────────
+/**
+ * 待确认期间「自动补推」—— 因为 iOS 上根本拦不住你划走它。
+ *
+ * 先把事实说清楚（2026-09-20 查证）：
+ *   - HA 的 `sticky` 是 **Android 专有**字段，iOS 没有对应能力；
+ *   - `interruption-level: critical` 只解决「吵醒你 / 绕过静音与专注」，
+ *     **不解决划走** —— HA 社区实测原话：*"Swiping/clearing the notification
+ *     stops the sound playback."* 划一下就没了，声音也停。
+ *   ⇒ **iOS 上不存在「不可划走」的通知。** 任何声称能锁住的方案都是错的。
+ *
+ * 所以正确的目标不是「划不走」，而是「**划走了也能自己回来**」：
+ * 记录还在 pending，就按 renotifySeconds 再推一次，直到你决策、或次数/时间用完。
+ * 同一条用同一个 `tag`，所以补推是**替换**那张卡而不是堆一屏 ——
+ * 你划走它，几秒后它会带着「（第 2 次提醒）」回来。
+ *
+ * 关闭方式：`renotifySeconds: 0`（默认就是 0，不吵）。
+ * 提醒语在正文里会标次数，见 ha.mjs 的 title 拼接。
+ */
+function scheduleRenotify(record, everySec, maxTimes) {
+  if (!(everySec > 0) || !(maxTimes > 0)) return;
+  let sent = 1; // 第 1 次就是 createApproval 里那次正常推送
+  const tick = async () => {
+    if (sent >= maxTimes) return;
+    const cur = store.get(record.id);
+    if (!cur || cur.status !== 'pending') return; // 已决策 / 已撤销 / 已过期 → 停
+    // 剩余时间不够再等一轮就别推了，免得刚推完就过期。
+    if (cur.expiresAt - Date.now() < everySec * 1000) return;
+    sent += 1;
+    try {
+      await channel.push({ ...record, renotify: sent });
+      store.audit({
+        event: 'push_renotified',
+        id: record.id,
+        tier: record.tier,
+        attempt: sent,
+      });
+    } catch {
+      /* 补推失败不影响原判定，下一次 tick 还会再试 */
+    }
+    setTimeout(tick, everySec * 1000);
+  };
+  setTimeout(tick, everySec * 1000);
+}
+
 async function createApproval(input) {
   const tool = input.tool || input.tool_name || 'unknown';
   const toolInput = input.tool_input !== undefined ? input.tool_input : input.toolInput;
@@ -243,10 +287,35 @@ async function createApproval(input) {
   let pushResult;
   try {
     pushResult = await channel.push(record, { baseUrl });
+    // 通道**主动**报告推送失败（不是抛错）也要留痕。
+    //
+    // 典型是「设备根本没在连」：ha.mjs 的 push() 会在推之前先探一次可收性，
+    // 确认掉线就直接返回 { ok:false, deviceOffline:true }，压根不去调 notify
+    // —— 因为 HA 对掉线设备照样回 200，调了也是白调。
+    // 这条路不走下面的 catch，所以原先**一条审计都没有**，
+    // 事后翻 audit.jsonl 只会看到这条记录莫名其妙 expired。
+    if (pushResult && pushResult.ok === false) {
+      store.audit({
+        event: 'push_failed',
+        id,
+        tier,
+        error: pushResult.detail || '通道报告推送失败',
+        channel: channel.name,
+        deviceOffline: pushResult.deviceOffline === true,
+      });
+      console.error(`[push] 通道 ${channel.name} 推送失败：${pushResult.detail || '未给原因'}`);
+    }
   } catch (e) {
     pushResult = { ok: false, detail: e.message };
     store.audit({ event: 'push_failed', id, tier, error: e.message, channel: channel.name });
     console.error(`[push] 通道 ${channel.name} 推送失败：${e.message}`);
+  }
+
+  // 推送成功了才值得补推 —— 推都没推出去的话，补推也只是重复失败。
+  // 次数/间隔读通道自己的配置（只有 ha 有这个概念，mock 通道不受影响）。
+  if (pushResult && pushResult.ok === true && !pushResult.skipped) {
+    const haCfg = (cfg.channels || {}).ha || {};
+    scheduleRenotify(record, Number(haCfg.renotifySeconds || 0), Number(haCfg.renotifyMax || 0));
   }
 
   return { record, pushResult };

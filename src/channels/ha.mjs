@@ -289,6 +289,30 @@ export function create(cfg, deps) {
     },
 
     async push(record) {
+      // ★ 推之前先确认目标设备真的在连 —— 否则这一推必然是白等。
+      //
+      // 这是「总是卡死两分钟」的真根因。HA 的本地推送在**手机没注册推送通道**时
+      // **照样回 200**（它只是把消息交给了推送服务，不保证送达），于是：
+      //   手机掉线 → callNotify 回 200 → 我们记 pushOk: true
+      //   → 上层认为「卡片在路上」，老老实实等满 TTL
+      //   → 最后一句「120s 内未收到确认，按默认拒绝」。
+      // 用户体感就是「总是卡死」，而且毫无线索可查。
+      //
+      // 缓存说掉线时**必须再强制探一次**：READINESS_TTL_MS 是 45 秒，
+      // 手机刚连回来时缓存可能还是旧的 false —— 拿旧结论去拒绝就是误拦。
+      // 强制探测是一次 /api/states 往返（约几十毫秒），只在「疑似掉线」时发生。
+      const cachedReadiness = await probeReadiness(false).catch(() => null);
+      if (cachedReadiness && cachedReadiness.reporting === false) {
+        const fresh = await probeReadiness(true).catch(() => null);
+        if (fresh && fresh.reporting === false) {
+          return {
+            ok: false,
+            deviceOffline: true,
+            detail: explainUnreachable(fresh, { device: notifyService, baseUrl }),
+          };
+        }
+      }
+
       const ts = TS_ORDER[record.tier] >= TS_ORDER[tsFrom];
       const critical = criticalFrom && TS_ORDER[record.tier] >= TS_ORDER[criticalFrom];
 
@@ -327,7 +351,13 @@ export function create(cfg, deps) {
 
       const body = {
         message: record.body + expandHint(record.options),
-        title: record.title,
+        // 补推时标出次数。iOS 上通知可以被划走（没有「不可划走」的通知），
+        // 网关会在 pending 期间自动补推 —— 这个后缀让用户知道
+        // 「刚才划掉的那张又回来了」，而不是以为来了个新请求。
+        // 仍用同一个 tag（`apr_<id>`），所以是**替换**而不是堆叠。
+        title: record.renotify
+          ? `${record.title}（第 ${record.renotify} 次提醒）`
+          : record.title,
         data: {
           tag: `apr_${record.id}`,
           group: 'agent-approval',
@@ -363,16 +393,19 @@ export function create(cfg, deps) {
         throw wrapped;
       }
 
-      // 成功一次就顺手把缓存刷成「在线」，免得紧随其后的 /healthz
-      // 还在拿 45 秒前那次失败说「设备掉线」。
-      readinessCache = {
-        at: Date.now(),
-        value: {
-          slug: deviceSlugFromNotifyService(notifyService),
-          liveness: [], context: [], entitiesSeen: 0, reporting: true,
-          reason: '刚才这条推送成功了，设备在线。',
-        },
-      };
+      // ⚠️ 这里**绝不能**把缓存断言成「在线」。
+      //
+      // `callNotify` 回 200 只说明 HA 收下了调用，**不说明设备收到了** ——
+      // 本地推送在设备掉线时照样回 200。原先这里写的是
+      // `reporting: true` + 「刚才这条推送成功了，设备在线。」，
+      // 等于**用一条假证据覆盖掉真探测**：
+      //   探测明明说「App 没在连」→ 一次 200 就改回「在线」
+      //   → /healthz 报 deviceReady: true → push() 也不肯快失败
+      //   → 上层空等满 TTL。整条链路上再没有任何一处说真话。
+      //
+      // 唯一诚实的做法是**作废缓存**：让下一次 /healthz 与下一次 push()
+      // 重新去问 HA 要真值（存活传感器有没有取值）。
+      readinessCache = { at: 0, value: null };
       return { ok: true, detail: `notify.${notifyService}` };
     },
 
