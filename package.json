@@ -1,9 +1,28 @@
 {
-  "name": "agent-approval",
+  "name": "agent-watch-approval",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "type": "module",
-  "description": "把 Agent 运行中需要确认的选项推到 iPhone / Apple Watch，腕上决策后回传给 Agent",
+  "description": "Push L2/L3 tool calls to iPhone / Apple Watch — wrist-level approval before execution. L0/L1 silent-pass, L3 never auto-allows. Built on self-hosted Home Assistant; no third-party push.",
+  "homepage": "https://watch-alert.coderknock.com/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/coder-knock/agent-watch-approval.git"
+  },
+  "bugs": {
+    "url": "https://github.com/coder-knock/agent-watch-approval/issues"
+  },
+  "keywords": [
+    "agent",
+    "approval",
+    "permission",
+    "iphone",
+    "apple-watch",
+    "home-assistant",
+    "hook",
+    "claude-code",
+    "mcp"
+  ],
   "bin": {
     "approve-hook": "./bin/approve-hook.mjs",
     "approval-gateway": "./src/gateway.mjs",

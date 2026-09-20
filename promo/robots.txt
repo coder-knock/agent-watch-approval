@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://watch-aler.coderknock.com/sitemap.xml
+Sitemap: https://watch-alert.coderknock.com/sitemap.xml
