@@ -2,9 +2,9 @@
 
 把 Agent 运行中需要拍板的选项推到 iPhone / Apple Watch，用户在手腕上选择后回传给 Agent。
 
-已通过 460 项自检（`approval test`：80 项分级 + 44 项 HA 通道单元 + 61 项 hook 协议
+已通过 472 项自检（`approval test`：80 项分级 + 44 项 HA 通道单元 + 69 项 hook 协议
 + 66 项「本机一次性确认」状态机 + 35 项 net-doctor 纯函数 + 45 项设备可收性
-+ 26 项存储容错 + 82 项端到端 + 21 项 MCP），
++ 26 项存储容错 + 92 项端到端 + 21 项 MCP），
 涵盖风险分级、令牌签发、重放拦截、签名篡改、超时兜底、hook 放行与拒绝、审计留痕、
 会话白名单的作用域与撤销、HA 通道的请求形状
 （`/api/services/<域>/<服务>` 那条 404 坑）、局域网地址漂移的判定
@@ -43,7 +43,7 @@ approval gw                   # 起网关，默认 127.0.0.1:7788，通道 mock
 | `approval net --repair` | 发现漂移就重启 HA 让它按当前地址重新广播 |
 | `approval netwatch install` | 装上地址漂移看门狗（每 120 秒自检，坏了自动修；**必须在普通终端里跑**） |
 | `approval link` | 真机往返测试：HA → iPhone/手表 → 点按钮 → 回传（第 1.5 节） |
-| `approval test` | 跑八套测试（80 项分级 + 44 项 HA 通道 + 61 项 hook + 66 项本机一次性确认 + 35 项 net-doctor + 45 项设备可收性 + 26 项存储容错 + 82 项网关自检 + 21 项 MCP 往返）。前八套纯本地必跑；第九套要活的网关，跑不了会标「按设计跳过」而不是判失败（见 2.2） |
+| `approval test` | 跑八套测试（80 项分级 + 44 项 HA 通道 + 61 项 hook + 66 项本机一次性确认 + 35 项 net-doctor + 45 项设备可收性 + 26 项存储容错 + 82 项网关自检 + 21 项 MCP 往返 = 439 项断言）。前八套纯本地必跑；MCP 那套要活的网关，跑不了会标「按设计跳过」而不是判失败（见 2.2） |
 | `approval test --with-push` | 同上，但允许 MCP 那套**真推一张卡片到手机**（网关是 `ha` 通道时才会问，见 1.6.1） |
 | `approval ha status` | HA 运行状态 + 日志 ERROR 数 |
 | `approval ha install` | 设成开机自启（**必须在普通终端里跑**，见 1.1.3） |
@@ -638,7 +638,9 @@ iOS App 按下通知按钮时会**同时**发两个事件：
       "criticalFromTier": "L3",
       "clearAfterDecision": true,
       "publicBaseUrl": "",
-      "phoneAccessKey": ""
+      "phoneAccessKey": "",
+      "renotifySeconds": 0,
+      "renotifyMax": 3
     }
   }
 }
@@ -678,9 +680,20 @@ iOS App 按下通知按钮时会**同时**发两个事件：
 
 #### 1.6.2 手机上怎么点到那个按钮
 
-iOS 的通知**不会**把动作按钮摊开显示，必须**展开**才看得见（详见「已知限制」里那一条）。
-展开的手势：锁屏上**从右往左滑**再点「查看」，或**长按**；不在锁屏时把通知**下拉**。
-**Apple Watch 上则是直接显示按钮**，所以「手表好用」并不代表「手机也能用」。
+iOS **和 watchOS 都**不把动作按钮摊开显示，必须**展开**才看得见（详见「已知限制」里那一条）。
+两边的展开手势不一样：
+
+| 设备 | 手势 |
+| --- | --- |
+| iPhone | 锁屏上**从右往左滑**再点「查看」，或**长按**；不在锁屏时把通知**下拉** |
+| Apple Watch | **旋转数码表冠把卡片滚到最底部** —— 按钮在长视图底部 |
+
+⚠️ **在手表上直接点卡片主体 = 打开 HA App，不产生任何决策。** 这不是故障，是 Apple 的
+默认行为；但用户很容易以为「我点过了」，而网关什么都没收到、fail-closed 拦下，
+看起来就成了「我明明同意了，它却说没同意」。所以**一定要滚表冠**。
+
+> 早先这里写过「Apple Watch 上直接显示按钮」——**2026-09-20 真机验证推翻了**。
+> 两边一样难发现，只是手势不同；「手表好用不代表手机好用」那条推论一并作废。
 
 想少一个步骤，可以走通知的 `url` 字段 —— **点通知主体不需要展开**。
 配上下面两个键，点一下就直接打开手机上的审批页（那一条会自动置顶高亮）：
@@ -701,6 +714,59 @@ curl -s "http://<本机LAN IP>:7788/phone.html?k=<phoneAccessKey>" | head -3
 那串一次性令牌（`APR:<id>:<选项>:<nonce>:<签名>`，见第 4 节）—— 它单次消费、有 TTL、
 且绑定到具体动作。所以即使有人打开页面，也只能看到「有哪些待确认项」，
 不能凭空造一个批准。尽管如此，**把接口暴露到局域网之前，先想清楚这个网段上都有谁。**
+
+#### 1.6.3 「划走通知」要不要再推一次（iOS 专属痛点）
+
+iOS 上**不存在「不可划走」的通知**：HA 社区原话是 *"Swiping/clearing the
+notification stops the sound playback."* —— 划一下，声音停，卡片也消失了。
+而 `interruption-level: critical` 只解决「吵醒你 / 绕过静音」，**不解决划走**。
+
+所以策略不是「锁住卡片」，而是「**划走了也能自己回来**」：这条记录还在 pending，
+就按 `renotifySeconds` 再推一次，直到你决策、或次数用完。同一条用同一个 `tag`，
+所以补推是**替换**那张卡（说明 iOS 的「重新发送」语义），不是堆一屏。
+正文的标题会带上「（第 N 次提醒）」。
+
+| 键 | 作用 | 默认 | 关掉的办法 |
+| --- | --- | --- | --- |
+| `renotifySeconds` | 两次推送之间间隔（秒）。必须 `> 0` 才会重推 | `0` | 设为 `0`（默认） |
+| `renotifyMax` | 一条记录最多重推几次 | `3` | 设为 `0` 或配合 `renotifySeconds: 0` |
+
+两个安全护栏写死了，不要动：
+1. 重推时若发现记录**已被决策 / 已撤销 / 已过期** → 立刻停。
+2. 若剩余 TTL 已经不够再等一轮 → 不推（避免「刚推完下一秒就过期」浪费一次重推）。
+
+每次重推都会在审计里留一行 `event: "push_renotified"`，含次数；后续若被划走仍超时，
+还能拿「一次都推到、为什么没决策」去查。
+
+#### 1.6.4 「设备掉线时怎么办」（HA 通道专属）
+
+推送之前，网关会**先**判一次「这台手机现在在不在 HA 上」—— 判定逻辑详见
+`src/channels/device-readiness.mjs` 的头部注释（一句话：App 在线时会持续上报四条
+默认启用、不需要任何 iOS 权限的传感器；四条全没值就是掉线）。
+
+- 缓存命中**在线** → 直接推，不挡任何延迟。
+- 缓存命中**掉线** → 强制再探一次（30ms 内的 `/api/states` 往返）。仍然掉线 →
+  网关**不调** `notify.mobile_app_*`，直接给调用方返回 `{ ok: false, deviceOffline: true, detail }`。
+  理由：HA 对掉线设备**照样回 200**，调了也是白调 —— 还会让上层以为卡片在路上，
+  老老实实等满 TTL（实测这就是「总是卡死两分钟」的真根因）。
+
+`detail` 字段是给人看的诊断文字（按 1.6.5 的「可执行说明」风格写的，
+「下一步该做什么」而不是「报了什么错」）。审计里也会留一行
+`event: "push_failed"` + `deviceOffline: true`。
+
+只对 HA 通道生效；mock / pushcut 通道没有这一层。
+
+#### 1.6.5 「为什么这次没推出去」的诊断格式
+
+诊断的价值不在于「报了什么错」，而在于「看完知道下一步做什么」。
+本组件里所有可执行说明都遵守这条原则：每一句都必须是「去某个地方做某件事」这种动作，
+而不是「调用方因网络抖动导致响应码 500」。具体落地：
+
+- `device-readiness.mjs::explainUnreachable` —— 把「掉线 / 判不了」翻译成三步自查
+  （网段 → HA App 在不在 → 实机自检）。
+- `ha.mjs::push` 失败路径 —— 同一句错误里带 `deviceOffline` 标记 + 可读 detail，
+  调用方不需要再去翻日志。
+- 不写 markdown 的 `**`（终端只会看到两个星号，像乱码一样）。强调用「全部」这种词就够了。
 
 ---
 
@@ -776,19 +842,42 @@ curl -s "http://<本机LAN IP>:7788/phone.html?k=<phoneAccessKey>" | head -3
 要传下面这些环境变量，只有两条路：写进 shell profile 让 hook 继承，或者直接内联在命令里：
 
 ```
-APPROVAL_FALLBACK_L2=allow /opt/homebrew/bin/node /path/to/agent-approval/bin/approve-hook.mjs
+APPROVAL_TTL_L2=90 /opt/homebrew/bin/node /path/to/agent-approval/bin/approve-hook.mjs
 ```
 
 可调环境变量：`APPROVAL_GATEWAY_URL`、`APPROVAL_TTL_L2`（默认 120）、
-`APPROVAL_TTL_L3`（默认 120）、`APPROVAL_FALLBACK_L2`（默认 `deny`）、
-`APPROVAL_FALLBACK_L3`（默认 `deny`）、`APPROVAL_HOOK_BUDGET`（默认 150，
+`APPROVAL_TTL_L3`（默认 120）、`APPROVAL_HOOK_BUDGET`（默认 150，
 本地阻塞等待的硬上限，必须小于 `timeout`）、`APPROVAL_DATA_DIR`（默认取
 `config.json` 的 `dataDir`；只有测试会用到）。
 
-> ⚠️ **`ask` 不是这里的一个可选项。** 它在这个宿主里等于「放行」，
-> 所以 `fallbackFor()` 会把 `ask` 降级成 `deny` 并在 stderr 打一条警告。
-> 想「弹个框问一下」，走下面 **2.1.3** 的 `approval confirm`。原因见本节的
-> 「`ask` 到底是什么意思」那一节 —— 那一节早先写错了，2026-09-19 已按活体实测改掉。
+**推送失败 / 网关不可达时怎么兜底**（这一组是本节最该看懂的）：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `APPROVAL_PUSH_FAIL_POLICY` | **`ask_user`** | 拦住 + reason 带标记，由 Agent 调 **AskUserQuestion** 用宿主的原生框问你。可选 `deny`（纯拦）/ `local`（转场本地审批页）/ `ask`（交回宿主确认框） |
+| `APPROVAL_FALLBACK_L2` | `deny` | 只在**显式设置**时才生效；设了就优先于上面的默认值 |
+| `APPROVAL_FALLBACK_L3` | `deny` | 同上。改它请当成一次「你做过的决定」 |
+
+> 「降级也是用**原本的方式**询问」这件事由 `ask_user` 那条承担：
+> hook 输出的判定仍是 **`deny`**（fail-closed 不破），但 reason 第一行是
+> `[approval: action_required=ask_user]`，Agent 的循环据此调用
+> **AskUserQuestion** —— 那才是宿主原生的确认框（走 HandleInterruptions）。
+> 于是链路是「拦住 → Agent 弹原生框问你 → 你确认 → 落一次性授权 → 重试放行」，
+> 全程由宿主原生 UI 询问，这套 hook 不另造确认界面。
+
+> ⚠️ **`permissionDecision:"ask"` 为什么不作为默认值。** 它的作用有两层：
+> `allowed` 只有 deny/allow 两个分支（所以它自己**不拦**），但它会被
+> `hasForcedAskDecision()` 读到，使 `canAutoApproveInBypassMode()` /
+> `canUseCachedApproval()` 返回 false —— 也就是「**禁止自动放行**、交回宿主常规
+> 权限流程」。**弹不弹框取决于宿主原本会不会问你**：
+>
+> - 需要审批的场景（bypass 模式 / 有缓存批准 / 工具要批准）→ 会弹框（实测确实会）；
+> - 沙箱快速路径（宿主日志里的 `sandbox path active, skipping 8-Phase permission check`）
+>   → 宿主本来就不问人，ask 变不出框，命令照跑。
+>
+> 所以它是**显式可选项**（`APPROVAL_PUSH_FAIL_POLICY=ask`），不是默认值：
+> 默认选行为不依赖权限模式的 `deny`，而「询问」由 `ask_user` 那条补上。
+> 完整的两层机制与反读出处见 `bin/approve-hook.mjs` 的 RAW_FALLBACK 注释。
 
 > **「改完是否立刻生效」—— 别想当然，分两种会话。**
 >
@@ -817,35 +906,42 @@ APPROVAL_FALLBACK_L2=allow /opt/homebrew/bin/node /path/to/agent-approval/bin/ap
 > - **探针本身要无害。** 我用的探针（一条 `dd` 写空设备的命令）即使 hook 没生效、
 >   真的被执行，也什么都不做。
 
-> **第一次打开 hook 时的建议**：保持默认，**不要**去设 `APPROVAL_FALLBACK_*`。
+> **第一次打开 hook 时的建议**：保持默认，**不要**去设 `APPROVAL_FALLBACK_*`
+> 或 `APPROVAL_PUSH_FAIL_POLICY`。
 >
-> 默认是 `deny`，即「确认没送到你手上 = 不放行」。代价是：网关没在跑时，
-> 你的 Agent 做任何 L2/L3 操作都会被直接拒绝，而原因不会写进报错里 ——
-> 所以真正该做的是 **2.1.1**（让网关开机自启）+ `approval doctor`，
-> **不是**把失败路径改成放行。
+> 默认是：判定 **`deny`**（「确认没送到你手上 = 不放行」），但 reason 里带上
+> `[approval: action_required=ask_user]` 标记与下一步 —— 所以 Agent 会**用宿主
+> 原本的方式**（AskUserQuestion 弹原生框）问你一次，不是干拒。
+>
+> 代价是：网关没在跑时，你的 Agent 做任何 L2/L3 操作都会先被拦一下，
+> 需要你答一次才能继续。所以真正该做的还是 **2.1.1**（让网关开机自启）
+> + `approval doctor`。
 >
 > 这里原先建议「头一周把 `APPROVAL_FALLBACK_L3` 设成 `ask`，网关掉线时
-> 退化成桌面弹窗」。**那条建议是错的**，两层都错：
+> 退化成桌面弹窗」。那条建议的问题有两层：
 >
 > - 那阵子 `APPROVAL_FALLBACK_L3` 被硬编码的 `deny` 绕过，设了也不生效；
-> - 更关键的是，`ask` 在这个宿主里**根本不弹框，而是等于放行**（见下）。
+> - 更关键的是 `ask` 的效果**取决于权限模式**（见 2.1.4 末尾）——
+>   在沙箱快速路径上它不阻止执行，所以它不能承担「一定问你一次」这个职责。
 >
 > 现在被拦住时该怎么办：看 `data/blocked-last.json`（hook 会自动记下最近一条），
 > 或者直接用下面这套流程。
 
-**hook 的四种输出**（`bin/approve-hook.mjs` 里的 `fallbackFor()` 就是这条界线）
+**hook 的判定表**（`bin/approve-hook.mjs` 里的 `decisionForPolicy()` 是这条界线）
 
 | 情形 | L2 | L3 | 说明 |
 |---|---|---|---|
 | L0 / L1 工具 | 无输出 | 无输出 | 交回原本的权限流程，**不静默提权** |
 | 你在手表/手机上点了「允许」 | `allow` | `allow` | |
 | 你点了「拒绝」 | `deny` | `deny` | |
-| **超时未确认** | `deny` | `deny` | 卡片已送到你手上，你看到了没答 →「没答就是没同意」。本地轮询到点没拿到结论就 deny。**这是策略默认，不受 FALLBACK 影响** |
-| **确认没能送到你手上** | `deny`（默认） | `deny`（默认） | 三条路径：网关返回非 2xx、网关不可达/异常、**推送失败（`pushOk:false`）** |
+| **超时未确认** | `deny` | `deny` | 卡片已送到你手上，你看到了没答 →「没答就是没同意」。本地轮询到点没拿到结论就 deny。**这是策略默认，不受任何降级开关影响** |
+| **确认没能送到你手上** | `deny` | `deny` | 三条路径：网关返回非 2xx、网关不可达/异常、**推送失败（`pushOk:false`）**。默认带 `ask_user` 标记与下一步 → Agent 用 AskUserQuestion 问你 |
 | ↑ 但你在弹框里点过「允许这一次」 | `allow` | `allow` | 一次性授权命中 → 放行**一次**，随即失效 |
+| ↑ 显式设 `...POLICY=ask` | `ask` | `ask` | 交回宿主确认框。⚠️ 效果取决于权限模式，见 2.1.4 末尾 |
+| ↑ 显式设 `...POLICY=local` | 转场 | 转场 | 打开本地审批页，你在那一页点 |
 
-最后两行是唯一受配置影响的情形，默认值都是 `deny`。第三条路径（推送失败）
-现在会先去查 `data/local-grants.json` 里那张一次性授权，见 **2.1.3**。
+默认值都是 `deny`，「转场」与「ask」只有显式配置才会发生。第三条路径（推送失败）
+会先去查 `data/local-grants.json` 里那张一次性授权，见 **2.1.3**。
 
 > **这里修过两个 bug，第二个是本次的核心。**
 >
@@ -853,48 +949,98 @@ APPROVAL_FALLBACK_L2=allow /opt/homebrew/bin/node /path/to/agent-approval/bin/ap
 > 出现在**三处**（网关非 2xx、超时未确认、网关不可达）—— 于是 `APPROVAL_FALLBACK_L3`
 > 在它唯一该生效的场景（网关掉线）里被硬编码绕过了。文档还建议你「头一周设成 `ask`」，
 > 等于让你调一个根本不存在的旋钮，而且没有任何断言会红 —— 因为
-> `bin/approve-hook.mjs` 当时**一个测试都没有**。现在 `test/hook.test.mjs`（61 项）
+> `bin/approve-hook.mjs` 当时**一个测试都没有**。现在 `test/hook.test.mjs`（92 项）
 > 真起子进程、喂真实 stdin 把这几条路径钉死了。
 > 顺带在 `src/core/risk.mjs` 补了一条：`shred` / `srm`（安全擦除，刻意让数据不可恢复）
 > 原先不在任何规则里，掉到默认的 L2 —— 比 `rm -rf ~/Documents` 的 L3 还低，方向是反的。
 >
-> **② 默认值本身是个 fail-open 漏洞。** `APPROVAL_FALLBACK_L2` 的默认值原来是 `ask`，
-> 而 `ask` 在这个宿主里等于**放行**（不是弹窗，见下）。也就是说：
-> **推送最可能失败的那条路径，反而是唯一一条会静默放行的路径。**
-> 现在默认改成 `deny`，并且显式配 `ask` 也会被降级成 `deny` + stderr 警告。
+> **② 默认值曾经是个 fail-open 漏洞（已修）。** `APPROVAL_FALLBACK_L2` 的默认值
+> 原来是 `ask`，而在**沙箱快速路径**上 `ask` 不阻止执行 —— 于是
+> **推送最可能失败的那条路径，反而是唯一一条会静默放行的路径**。
 > 这个漏洞是被用户的报障牵出来的：「推送到手表失败…已按 deny 处理，这个处理不对」。
+> 现在默认是 `deny`；`ask` 仍可显式设置（它在需要审批的场景里确实会弹框），
+> 但会在 stderr 提醒你它的效果取决于权限模式。
 
-> **`ask` 到底是什么意思 —— 我先前写错了，2026-09-19 按活体实测改正。**
+#### 2.1.4 推送失败时让 Agent 自己弹窗（`APPROVAL_PUSH_FAIL_POLICY`）
+
+**默认就是这一条**（`ask_user`）。整条链路是：
+
+1. hook 看到推送失败 / 网关不可达 → 拦住（判定仍是 `deny`），并**写一条**到
+   `data/blocked-last.json`；
+2. 同时在 `permissionDecisionReason` 里给出**机器可读的标记 + 人类可读的下一步**；
+3. Agent 的循环看到标记 → 真的**调** `AskUserQuestion` 问你（这一步走的是
+   宿主的原生确认框，`[HandleInterruptions] Approval dialog shown for tool: AskUserQuestion`）；
+4. 你选「允许这一次」→ Agent 执行 `approval confirm --yes` → 落下**一次性授权**；
+5. Agent **重试**同一条命令 → hook 命中那张授权 → 放行这一次。
+
+这就是用户要的「**降级也用原本的方式询问**」：拦住是 hook 做的，**询问**是宿主原生
+UI 做的，这套 hook 不另造一个确认界面。reason 的实际形状：
+
+```
+[approval: action_required=ask_user]
+推送到手表失败（device_offline：【诊断】App 没在连：4 条存活传感器全部是「没有值」…），已拦住而不是放行：npm publish --access public（发布到公共仓库，无法撤回）
+下一步：① 用 AskUserQuestion 问一句「是否允许执行上面这条命令？」；② 用户选「允许这一次」后执行 `approval confirm --yes --json`（绑定 0adfaf），并重试**逐字节相同**的那条命令（本机一次性授权只能消费一次，重试的 tool_input 必须一致）。
+```
+
+让 Agent 循环里写 `if (reason.startsWith('[approval: action_required=ask_user]'))` 即可。
+
+| 值 | 含义 | 默认 |
+|---|---|---|
+| `ask_user` | deny + reason 第一行带 `[approval: action_required=ask_user]` + 下一步 | ✅ |
+| `deny` | 普通 deny reason，没有标记、不给下一步（想彻底静默拦截时用） | |
+| `local` | 转场到网关自带的本地审批页（先探可达再开），你在那一页点，决策经 `/v1/decision` 回传 | |
+| `ask` | 直接输出 `permissionDecision:"ask"`，交回宿主确认框。⚠️ 效果取决于权限模式，见本节末尾 | |
+
+注意：
+- **前三个值下，hook 输出的判定都是 `deny`**，fail-closed 不破。
+  只有显式选 `ask` / 显式设 `APPROVAL_FALLBACK_L*=allow` 才会改变判定 ——
+  这两条都是「你做过的决定」，不会被默认值悄悄带上。
+- **三条降级路径共用这一套策略**：网关非 2xx、网关不可达、推送失败。
+  它们此前各写各的（后两条只丢一句原因），于是同一个原因会有两种表现 ——
+  用户看到的「只有提醒，不能确认」就出在那个分裂上。
+- 推送失败的种类在 `reason` 里细分开：`device_offline` / `push_5xx`
+  / `push_4xx` / `channel_error` / `unknown` —— 排查时看那一个字段就知道该
+  去查 HA / 网络 / 设备 / 服务。
+- 转场（`local`）有节流与熔断：同一页面 30 秒内只开一次；连续 3 次转场都没人
+  决策就停止转场（否则每条 L2 都要空等满 TTL，Agent 会像死了一样）。
+  成功决策一次即复位。可用 `APPROVAL_HANDOFF_GAP_SECONDS` /
+  `APPROVAL_HANDOFF_MAX_UNANSWERED` 调整。
+
+> **`ask` 到底是什么意思 —— 这个注释被改过三次，最终结论是「两句并存」。**
 >
-> **旧结论（错误）**：`ask` 会交给「正常权限流程」= 弹原生确认框，所以
-> `FALLBACK = ask` 的语义是「降级成桌面弹窗，绝不静默放行」。
+> 三次的经过（留在这里是因为每次都是「只看到一半」造成的）：
 >
-> **正确结论**：**本构建的 WorkBuddy 不实现 `ask`。输出 `ask` 等于放行。**
+> 1. 起初写「`ask` 会交给正常权限流程弹原生框，所以 `FALLBACK=ask` 是
+>    「降级成桌面弹窗，绝不静默放行」」；
+> 2. 2026-09-19 活体 A/B 推翻了它 —— 输出 `ask` 时 L2 探针**照常执行**
+>    （宿主日志：`skipping 8-Phase permission check` → `prompted=false`），
+>    于是结论变成「本构建不实现 `ask`，输出 `ask` 等于放行」；
+> 3. 2026-09-20 再反读，发现第 2 步也是过度概括 —— `ask` 确实会被读到，
+>    只是作用是「禁止自动放行」。用户的实测也确认：在需要审批的场景**确实会弹框**。
 >
-> 错误的来源：我反读的是 **SDK 回调型 hook** 那条路（`control_request` →
-> `hook_callback` → `aggregateResults`），那里确实完整实现了 `ask`。
-> 但 `settings.json` 里的 **command 型 hook** 走的是另一条路，那条路上没有 `ask` 分支：
+> **最终结论（两句都要看）：**
 >
-> ```js
-> // HookExecutor.parseHookOutput()
-> let ep = { allowed: 0 === eA, exitCode: eA ?? -1, ... };   // 初值 = 「exit 0 即 allowed」
-> if (eA.hookSpecificOutput?.permissionDecision) {
->   const el = eA.hookSpecificOutput.permissionDecision;
->   "deny"  === el ? (ep.allowed = false, ep.blockSource = "json", ep.blocking = true)
-> : "allow" === el && (ep.allowed = true);
->   // ← "ask" 没有分支，直接落到初值 allowed = (exitCode === 0) = true
-> }
+> - **`ask` 自己不拦。** `executePreToolUseHooks()` 里 `allowed` 只有 deny/allow
+>   两个分支，调用方只判 `if (!ew.allowed)` —— 所以这一步不会拦住命令。
+> - **但 `ask` 会被读到，并禁止自动放行。**
+>   ```js
+>   hasForcedAskDecision(eA, el) { return this.getCachedPreToolUseResult(eA, el)?.permissionDecision === "ask" }
+>   canAutoApproveInBypassMode(…) { return !(… || this.hasForcedAskDecision(eA, el)) && … }
+>   canUseCachedApproval(…)        { return !this.hasForcedAskDecision(eA, el) && … }
+>   ```
+>   它让宿主不自动批、不复用缓存批准，于是落回常规权限流程 —— 弹框发生在那里。
 >
-> // SessionToolManager.executePreToolUseHooks()
-> let ed = eu.allowed;
-> "deny" === el ? ed = false : "allow" === el && (ed = true);   // ← 同样漏掉 ask
-> return { allowed: ed, ... };                                  // 调用方只读 .allowed
-> ```
+> **所以：`ask` 的语义是「禁止自动放行，交回宿主常规权限流程」，
+> 而它到底会不会变成一个框，取决于宿主原本会不会问你。**
+> 沙箱快速路径上宿主本来就不问人，`ask` 变不出框；需要审批的场景则会弹。
 >
-> 两处的 `catch` 也都是 `{ allowed: true }` —— hook 自己崩了同样是放行。
-> 合起来就是：**`deny` → 拦住；其余一切（`ask` / 空输出 / 崩溃）→ 放行。**
+> **为什么它不做默认值**：deny 的行为不依赖权限模式。而「一定要问你一次」
+> 这个职责交给 `ask_user`（把询问交给 `AskUserQuestion`，那是宿主原生入口）。
+> `ask` 保留为显式选项，并在 stderr 提醒它的模式依赖。
+
+> **历史证据（保留备查，避免下次再走一遍弯路）**
 >
-> **活体 A/B（推送必然失败的前提下，2026-09-19）**：
+> 那次活体 A/B 的观察是真的，只是当时把结论说满了。观察：
 >
 > | 探针 | 钩子输出 | 结果 |
 > |---|---|---|
@@ -905,22 +1051,39 @@ APPROVAL_FALLBACK_L2=allow /opt/homebrew/bin/node /path/to/agent-approval/bin/ap
 > `[BashTool] sandbox path active, skipping 8-Phase permission check` →
 > hook 输出「已按 ask 处理」→ `[BashTool] execute start` →
 > `[SandboxOrchestrator] OUTCOME | outcome=sandbox-success | prompted=false`。
-> **`prompted=false` —— 根本没有弹框。**
+> **`prompted=false` —— 那一次确实没有弹框。**
 >
-> 顺带说明 `ask` 唯一可能弹框的地方是 `HandleInterruptions`
-> （`hasForcedAskDecision()` → `permissionDecision === "ask"` → 写进 `providerData`
-> → 日志 `Approval dialog shown for tool: X`）。但那条路只在**宿主自己判定需要批准**
-> 时才走，沙箱快速路径不经过它 —— 所以它跟 `settings.json` 的 command hook 无关。
+> 现在能解释清楚了：那一条 L2 走的是**沙箱快速路径**，宿主自己就不打算问人，
+> 所以 `ask` 变不出框。换成需要审批的场景（bypass 模式、有缓存批准、工具本身要批准），
+> `hasForcedAskDecision()` 会阻止自动放行，框就出来了 —— 用户的实测证实了这一点。
+>
+> 两层机制的代码出处：
+> ```js
+> // HookExecutor.parseHookOutput() —— 只有 deny/allow 分支，ask 落到初值
+> "deny" === el ? (ep.allowed = false, …) : "allow" === el && (ep.allowed = true);
+>
+> // SessionToolManager.executePreToolUseHooks() —— 调用方只读 .allowed
+> let ed = eu.allowed;
+> "deny" === el ? ed = false : "allow" === el && (ed = true);
+> return { allowed: ed, permissionDecision: el, … };
+>
+> // 但 ask 被透传到 preToolUseHookResults，然后被这里读到 ↓
+> hasForcedAskDecision(...) { return this.getCachedPreToolUseResult(...)?.permissionDecision === "ask" }
+> canAutoApproveInBypassMode(…) { return !(… || this.hasForcedAskDecision(…)) && … }
+> canUseCachedApproval(…)        { return !this.hasForcedAskDecision(…) && … }
+> ```
 >
 > **怎么自己复核**（这条结论可证伪，别只信文档）：把网关停掉，然后跑
-> `approval tier` 里那条 L2 探针，看命令有没有真的跑起来。
-> 想更省事就跑 `approval test` —— `test/hook.test.mjs` §4/§5 把这几种降级路径
-> 全钉住了（包括「显式设成 `ask` 时也必须是 `deny`」）。
+> `approval tier` 里那条 L2 探针，看命令有没有真的跑起来 —— 如果它跑起来了，
+> 说明你这条工具走的是沙箱快速路径，`ask` 在你这里等于放行，别用它做兜底。
+> 想更省事就跑 `approval test`：`test/hook.test.mjs` §4/§5/§10 把这几种降级路径
+> 全钉住了（默认 deny + 标记；显式 ask 才透出 ask；显式 allow 才放行）。
 
 #### 2.1.1 网关必须开机自启，否则 hook 会静默降级
 
 hook 的每一跳都要问网关。网关不在 → 所有 L2/L3 都走「网关不可达」分支
-（L2 降级成桌面弹窗、L3 fail-closed 直接拒），而**报错里不会写原因**。
+（拦住 + `ask_user` 标记，由 Agent 用 AskUserQuestion 问你一次），而**报错里不会写原因**
+—— 所以它拦下来的命令会看起来像「Agent 忽然不干活了」。
 
 原先网关是在某个 Agent 会话里用 `scripts/run-detached.py` 拉起来的 —— 那种进程
 **重启 Mac 就没了**。现在有了正经的 LaunchAgent：
@@ -1111,7 +1274,8 @@ approval net --repair    # 漂移了就重启 HA 让它重新广播
 ```bash
 approval test          # 80 项分级 + 44 项 HA 通道 + 61 项 hook
                        # + 66 项本机一次性确认 + 35 项 net-doctor
-                       # + 82 项网关 + 21 项 MCP
+                       # + 45 项设备可收性 + 26 项存储容错
+                       # + 82 项网关 + 21 项 MCP = 439 项
 ```
 
 它会真启一个 MCP 子进程走完整 JSON-RPC 握手，发一条确认请求，
@@ -1396,11 +1560,14 @@ approval sessions revoke Bash              # 只撤 Bash
 
   即三条路：锁屏上**从右往左滑**再点「查看」、**长按**、或（不在锁屏时）把通知**下拉**。
   **可操作通知与普通通知的外观完全一样** —— 没有任何线索告诉你需要展开它。
-  而 **Apple Watch 反而直接把按钮显示出来**，所以现象就是
-  「手表一直好用，手机找不到按钮」——「手表能用」并不代表「手机也能用」。
+  **Apple Watch 同样要展开**，手势是「旋转数码表冠滚到通知底部」，按钮在长视图底部。
+  ⚠️ 而且**点卡片主体 = 打开 App，不产生任何决策** —— 用户最容易在这里误判成「我点过了」，
+  然后 fail-closed 拦下，看起来就像「我明明同意了，它却说没同意」。
+  > 这里原先写的是「Apple Watch 反而直接把按钮显示出来」——**2026-09-20 真机验证推翻了**。
+  > 两个平台一样难发现，只是手势不同。
   两条应对已落到代码里：
-  1. 通知正文尾部追加一行「长按这张卡片 → 展开「…」」（`expandHint()`），
-     把「需要展开」这件事直接用文字说出来；
+  1. 通知正文尾部追加一行「按钮在卡片底部：手机长按展开，手表转表冠滚到底 → 「…」」
+     （`expandHint()`），把「需要展开」这件事直接用文字说出来，且**必须同时覆盖两个平台**；
   2. 每个按钮配 SF Symbol 图标（须 `sfsymbols:` 前缀，仅 SF Symbols 库可用，
      需 iOS App ≥ 2021.10），展开后一眼分清 允许（勾）/ 拒绝（叉）/ 详情（i）。
   还有第三条退路：`data.url` 是**点通知主体**就能用的（不需要展开）。
@@ -1456,7 +1623,7 @@ agent-approval/
 ├── public/phone.html        手机模拟器 / 兜底确认页
 ├── test/
 │   ├── risk.test.mjs        80 项风险分级回归（盯「无害命令被误判成要推送」的噪音）
-│   ├── ha-channel.test.mjs  44 项 HA 通道单元测试（假 fetch，钉死请求形状）
+│   ├── ha-channel.test.mjs  44 项 HA 通道单元测试（假 fetch，钉死请求形状 / 推送前 / 试一下设备在不在）
 │   ├── hook.test.mjs        61 项 hook 协议测试（真起子进程，喂真实 stdin；
 │   │                        §9 覆盖「推送失败 → 拦住 → 本机确认 → 放行一次」全链，
 │   │                        §10 钉死「改写 description 仍须命中」的回归）
@@ -1476,7 +1643,7 @@ agent-approval/
 ```bash
 # ── 日常：用 approval（任何目录都能跑）──────────────────────
 approval gw                                # 起网关（前台）
-approval test                              # 80 + 30 + 55 + 55 + 28 + 45 + 26 + 82 + 21 项自检
+approval test                              # 80 + 44 + 61 + 66 + 35 + 45 + 26 + 82 + 21 = 439 项自检
 approval health                            # 通道是否就绪
 approval pending                           # 当前待确认
 approval audit 20                          # 最近 20 条审计

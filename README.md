@@ -33,6 +33,29 @@ The HMAC-signed action token (`APR:<id>:<option>:<nonce>:<sig>`) carries the
 decision authority — no long-lived key ever leaves the gateway. WebSocket
 round-trip means the Mac needs no port forwarding or public callback.
 
+## When the wrist path is down
+
+Default-deny does **not** mean "you get nothing but a refusal". The hook's verdict
+is always `deny` (so it never depends on the host's permission mode), but the
+question keeps travelling — four fallback steps, none of which pull you out of
+your workflow:
+
+| Step | Fallback | How |
+| --- | --- | --- |
+| ① | Local one-shot grant | The one `approval confirm` wrote after you picked "allow once". Checked before every policy, not affected by any switch. |
+| ② | **Block + marker → Agent re-asks with the host's own dialog** | **Default** (`ask_user`): the reason starts with `[approval: action_required=ask_user]`, so the Agent calls `AskUserQuestion` — the confirm dialog the host already has. |
+| ③ | Hand off to the gateway's local approval page | Opt-in: `APPROVAL_PUSH_FAIL_POLICY=local`. Probes reachability first, so no dead browser tabs. |
+| ④ | Just stay denied + write `blocked-last.json` | When nothing above applies. |
+
+Step ② is the default because it puts "ask the usual way" on the host's own
+dialog instead of inventing another confirmation UI. Why not
+`permissionDecision:"ask"`? Because ask's effect **depends on the permission
+mode** — it really does pop a dialog in approval-requiring paths, but on the
+sandbox fast path the host asks nobody, so ask can't produce a dialog and the
+command runs. `deny` doesn't gamble on the mode, and step ② covers the asking.
+
+`APPROVAL_PUSH_FAIL_POLICY` accepts `ask_user` (default) / `deny` / `local` / `ask`.
+
 ## Quick start
 
 ```bash
@@ -51,21 +74,22 @@ npm start                     # mock channel at http://127.0.0.1:7788
 ## Tests
 
 ```bash
-npm run selftest              # 82 gateway e2e
-npm run test:ha-channel       # 44 channel round-trip
-npm run test:risk             # 80 risk classification
-npm run test:hook             # 61 hook protocol
-node test/local-grant.test.mjs # 66 local-confirm state machine
-node test/device-readiness.test.mjs  # 45 device-readiness
-node test/store-resilience.test.mjs  # 26 storage fault-tolerance
-node test/net-doctor.test.mjs        # 35 net-drift detection
-# Total: 454 passing
+npm run selftest                     # 92 gateway end-to-end
+npm run test:hook                    # 92 hook protocol (spawns a real subprocess)
+npm run test:risk                    # 80 risk classification
+node test/local-grant.test.mjs       # 66 local one-shot confirm state machine
+npm run test:ha-channel              # 59 HA channel round-trip
+node test/device-readiness.test.mjs  # 45 device reachability
+node test/net-doctor.test.mjs        # 35 address-drift detection
+node test/store-resilience.test.mjs  # 29 storage fault-tolerance
+# Total: 498 passing across 8 suites
+# (node test/mcp-e2e.mjs additionally needs a live gateway)
 ```
 
 ## Links
 
 - Landing page: <https://watch-alert.coderknock.com/>
-- Skill page: <https://skillhub.cn/skills/user_69f76828/wrist-approval-gateway>
+- Skill page: <https://skillhub.cn/skills/indiv-coderknock/wrist-approval-gateway>
 - Install guide: [INSTALL.md](./INSTALL.md)
 - Full manual (why & how): [SETUP.md](./SETUP.md)
 - Promo site source: [promo/](./promo/)
@@ -93,7 +117,7 @@ bin/
 mcp/approval-mcp.mjs       # MCP server exposing /v1/approvals
 public/phone.html          # browser-as-iPhone simulator
 scripts/                   # install, repair, doctor, netwatch
-test/                      # 8 suites, 454 tests
+test/                      # 8 suites, 498 assertions
 ```
 
 ## License

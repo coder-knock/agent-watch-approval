@@ -207,9 +207,36 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .notif .acts button{flex:1;min-height:44px;padding:0 6px;font-size:12.5px;border-radius:9px;background:#22303f;border-color:var(--line-soft)}
 .notif .acts button[data-verdict=allow]:hover{border-color:rgba(37,224,138,.7);color:var(--allow)}
 .notif .acts button[data-verdict=deny]:hover{border-color:rgba(255,77,109,.7);color:var(--deny)}
-#grantBtn{border-color:rgba(255,178,63,.45);color:#ffe0b0;
-  background:linear-gradient(180deg,rgba(255,178,63,.16),rgba(255,178,63,.05))}
-#grantBtn:hover{border-color:rgba(255,178,63,.78)}
+/* 宿主原生确认框 —— 演示「降级也是用原本的方式询问」。
+   它不是我们另造的界面，而是 Agent 收到 ask_user 标记后调 AskUserQuestion
+   弹出来的那个框；这里按宿主 IDE 对话框的样子复刻，让访客看清这一跳。 */
+.dlg{
+  margin-top:20px;border:1px solid rgba(0,212,255,.34);border-radius:var(--r);
+  background:linear-gradient(180deg,#0d1826,#0a121c);
+  box-shadow:0 18px 44px rgba(0,0,0,.55),inset 0 0 0 1px rgba(255,255,255,.03);
+  overflow:hidden;display:none;
+}
+.dlg.show{display:block;animation:in .32s}
+.dlg .dlghead{display:flex;align-items:center;gap:9px;padding:10px 15px;
+  border-bottom:1px solid var(--line-soft);background:rgba(0,212,255,.05)}
+.dlg .dlgbadge{font:11px/1 var(--mono);letter-spacing:.08em;color:var(--pri);
+  border:1px solid rgba(0,212,255,.35);border-radius:6px;padding:4px 7px;white-space:nowrap}
+.dlg .dlgsrc{font:11px/1 var(--mono);color:var(--muted);margin-left:auto;white-space:nowrap}
+.dlg .dlgbody{padding:15px}
+.dlg .dlgq{font-size:14.5px;font-weight:500}
+.dlg .dlgcmd{margin-top:11px;font:12px/1.6 var(--mono);color:#a9c3d4;background:#060a11;
+  border:1px solid var(--line-soft);border-radius:9px;padding:9px 11px;word-break:break-all}
+.dlg .dlgnote{margin-top:11px;font-size:12.5px;color:var(--muted)}
+.dlg .dlgmarker{margin-top:11px;font:11.5px/1.65 var(--mono);color:var(--warn);
+  background:rgba(255,178,63,.07);border:1px solid rgba(255,178,63,.28);
+  border-radius:9px;padding:9px 11px;word-break:break-all}
+.dlg .dlgacts{display:flex;gap:9px;padding:0 15px 15px;flex-wrap:wrap}
+.dlg .dlgacts button{min-height:44px;padding:0 15px;font-size:13px;border-radius:9px}
+.dlg .dlgacts button[data-dlg=allow]{border-color:rgba(37,224,138,.5);color:#b9ffdb;
+  background:linear-gradient(180deg,rgba(37,224,138,.14),rgba(37,224,138,.04))}
+.dlg .dlgacts button[data-dlg=allow]:hover{border-color:rgba(37,224,138,.85)}
+.dlg .dlgacts button[data-dlg=deny]:hover{border-color:rgba(255,77,109,.75);color:var(--deny)}
+.dlg .dlgacts button:disabled{opacity:.45;cursor:not-allowed}
 .notif.allow{background:rgba(9,38,28,.97);border-color:rgba(37,224,138,.65)}
 .notif.deny{background:rgba(42,12,20,.97);border-color:rgba(255,77,109,.65)}
 .seal{text-align:center;font:500 14px/1.5 var(--mono);letter-spacing:.06em;padding:26px 0;display:none}
@@ -245,7 +272,7 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .tiers{display:grid;gap:11px;margin-top:30px}
 .tier{display:grid;grid-template-columns:76px 1fr;gap:16px;align-items:start;border:1px solid var(--line-soft);border-radius:var(--r);background:var(--panel);padding:16px 18px}
 .tier .tag{font:500 19px/1 var(--mono);padding-top:2px}
-.tier.t0 .tag{color:#5d7387}
+.tier.t0 .tag{color:#74899b}
 .tier.t1 .tag{color:#8fb4c9}
 .tier.t2 .tag{color:var(--warn)}
 .tier.t3 .tag{color:var(--deny)}
@@ -293,8 +320,8 @@ footer .fin span{border:1px solid var(--line-soft);border-radius:99px;padding:7p
     <em>推送通道是自建的 Home Assistant</em> —— 不用第三方推送服务，不用自写 iOS App。
   </p>
   <div class="figures">
-    <div class="fig"><div class="n">460</div><div class="k">项自检全部通过</div></div>
-    <div class="fig"><div class="n">9</div><div class="k">套测试，含 80 项分级回归</div></div>
+    <div class="fig"><div class="n">498</div><div class="k">项自检全部通过</div></div>
+    <div class="fig"><div class="n">8</div><div class="k">套测试，含 80 项分级回归</div></div>
     <div class="fig"><div class="n">0</div><div class="k">个第三方推送服务</div></div>
     <div class="fig"><div class="n">L0–L3</div><div class="k">四档风险分级</div></div>
   </div>
@@ -361,7 +388,8 @@ footer .fin span{border:1px solid var(--line-soft);border-radius:99px;padding:7p
   <h2>走一遍完整链路</h2>
   <p class="sub">
     点下面的按钮，看一条 L3 命令怎么从 Agent 走到你的手腕、再走回来。
-    中途把「手机离线」打开，可以看它在推送失败时的<b style="color:var(--txt)">兜底行为</b> —— 那是这套系统最见功力的地方。
+    中途把「手机离线」打开，可以看它在推送失败时怎么<b style="color:var(--txt)">换一条路继续问你</b> ——
+    判定仍然是拦住，但询问会交回宿主<b style="color:var(--txt)">原本的确认框</b>，你不必离开工作流。
   </p>
 
   <div class="demo">
@@ -428,8 +456,26 @@ footer .fin span{border:1px solid var(--line-soft);border-radius:99px;padding:7p
       </div>
     </div>
 
-    <div style="display:flex;justify-content:center;gap:10px;margin-top:16px;flex-wrap:wrap">
-      <button id="grantBtn" style="display:none">签发本机一次性授权</button>
+    <!-- 宿主原生确认框：Agent 读到 ask_user 标记后调 AskUserQuestion 弹出的那个框。
+         这一跳是整条降级链路的重点 —— 询问始终由宿主原本的界面承担。 -->
+    <div class="dlg" id="dlg" role="dialog" aria-labelledby="dlgQ">
+      <div class="dlghead">
+        <span class="dlgbadge">宿主的原生确认框</span>
+        <span class="dlgsrc" id="dlgSrc">AskUserQuestion</span>
+      </div>
+      <div class="dlgbody">
+        <div class="dlgq" id="dlgQ">是否允许执行上面这条命令？</div>
+        <div class="dlgcmd">git push --force origin main</div>
+        <div class="dlgnote">
+          手表那条路没走通，命令已被拦住。hook 把「换你来问一句」交给了宿主本来就有的这个框 ——
+          不另造确认界面，也不用你去别的页面。
+        </div>
+        <div class="dlgmarker">[approval: action_required=ask_user]</div>
+      </div>
+      <div class="dlgacts">
+        <button data-dlg="allow">允许这一次</button>
+        <button data-dlg="deny">拒绝</button>
+      </div>
     </div>
 
     <div class="log" id="log" role="log" aria-label="执行日志" aria-live="off"><div class="ln"><span class="t">00.00</span><span class="m ph">等待开始 —— 点上面的按钮</span></div></div>
@@ -495,8 +541,10 @@ footer .fin span{border:1px solid var(--line-soft);border-radius:99px;padding:7p
     </div>
     <div class="g6">
       <div class="k">fail-closed</div>
-      <h4>推不出去就拦住</h4>
-      <p>推送失败不降级成放行，而是拦住命令，再让你在桌面上一次性放行这一条。</p>
+      <h4>推不出去就拦住，但不会只剩一句拒绝</h4>
+      <p>判定恒为 <b>deny</b>（不赌权限模式）。拦住的同时降级继续往下走：先用本机一次性授权；
+        没有就让 Agent 用<b>宿主原本的确认框</b>问你一次；再不行转场本地审批页；
+        最后才停在拒绝，并把这一条记进 <code>blocked-last.json</code>。</p>
     </div>
     <div class="g6">
       <div class="k">audit</div>
@@ -515,10 +563,10 @@ footer .fin span{border:1px solid var(--line-soft);border-radius:99px;padding:7p
   <img class="brandmark sm" src="data:image/jpeg;base64,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" alt="Approval Gateway · 腕上确认网关" width="72" height="72">
   <div>腕上确认网关 · 推送通道为自建 Home Assistant，不依赖任何第三方推送服务，也不需要在 iPhone 上装额外的东西。</div>
   <div style="margin-top:14px">官网：<a href="https://watch-alert.coderknock.com/" style="color:var(--pri);text-decoration:none">watch-alert.coderknock.com</a></div>
-  <div style="margin-top:6px">技能页：<a href="https://skillhub.cn/skills/user_69f76828/wrist-approval-gateway" style="color:var(--pri);text-decoration:none;word-break:break-all">skillhub.cn/skills/user_69f76828/wrist-approval-gateway</a></div>
+  <div style="margin-top:6px">技能页：<a href="https://skillhub.cn/skills/indiv-coderknock/wrist-approval-gateway" style="color:var(--pri);text-decoration:none;word-break:break-all">skillhub.cn/skills/indiv-coderknock/wrist-approval-gateway</a></div>
   <div class="fin">
-    <span>460 项自检</span>
-    <span>9 套测试</span>
+    <span>498 项自检</span>
+    <span>8 套测试</span>
     <span>L0–L3 分级</span>
     <span>HMAC 签名授权</span>
     <span>单次消费</span>
@@ -529,7 +577,12 @@ footer .fin span{border:1px solid var(--line-soft);border-radius:99px;padding:7p
 
 </div>
 
-<script>
+<!-- data-cfasync="false"：这个 Zone 上开着 Rocket Loader，它会把内联 -->
+<!-- <script> 改写成 <script type="<hash>-text/javascript">，改成由它自己的 -->
+<!-- rocket-loader.min.js 异步取回执行。一旦那个脚本被广告拦截器 / CSP 挡掉，   -->
+<!-- 整页 JS 就静默死掉 —— 对一页全靠 JS 的演示来说是单点故障。带这个属性     -->
+<!-- 让 Rocket Loader 跳过本页脚本，保住「HTML 里就是可执行 JS」。              -->
+<script data-cfasync="false">
 (function(){
   var $ = function(s){ return document.querySelector(s); };
   var sleep = function(ms){ return new Promise(function(r){ setTimeout(r, ms); }); };
@@ -613,8 +666,8 @@ footer .fin span{border:1px solid var(--line-soft);border-radius:99px;padding:7p
     $('#seal').className = 'seal';
     $('#seal').textContent = '';
     $('#idle').classList.remove('hide');
-    $('#grantBtn').style.display = 'none';
-    $('#grantBtn').disabled = false;
+    $('#dlg').classList.remove('show');
+    $('#dlg').querySelectorAll('button').forEach(function(b){ b.disabled = false; });
     $('#runBtn').disabled = false;
     clearStations();
     ['agent','gw','ha','watch'].forEach(function(id){
@@ -639,7 +692,7 @@ footer .fin span{border:1px solid var(--line-soft);border-radius:99px;padding:7p
     $('#notif').className = 'notif';
     $('#seal').className = 'seal';
     $('#idle').classList.remove('hide');
-    $('#grantBtn').style.display = 'none';
+    $('#dlg').classList.remove('show');
     $('#log').innerHTML = '';
     clearStations();
 
@@ -678,21 +731,46 @@ footer .fin span{border:1px solid var(--line-soft);border-radius:99px;padding:7p
 
       stn('ha', '推送未送达', 'err');
       await fly('gw-ha', 'neg');
-      stn('gw', '推送失败 → fail-closed', 'err');
-      log('推送失败。按设计<b>拦截</b>，不静默放行', 'r');
-      await sleep(T(260));
+      stn('gw', '推送失败 → 拦住（deny）', 'err');
+      log('推送失败。按设计<b>拦住</b>，不静默放行', 'r');
+      await sleep(T(240));
+
+      // ── 降级第 ② 步：判定仍是 deny，但把「询问」交回宿主原本的界面 ──
+      log('判定恒为 <b>deny</b> —— 不赌权限模式。但降级继续往下走：', 'p');
+      await sleep(T(200));
+      log('[approval: action_required=ask_user]', 'y');
+      log('　推送失败（device_offline），已拦住而不是放行：' + CMD, 'y');
+      log('　下一步：① 用 AskUserQuestion 问一句；② 选「允许这一次」后执行 approval confirm --yes --json，并重试逐字节相同的命令', 'y');
+      await sleep(T(380));
 
       await fly('agent-gw', 'neg');
       stn('gw', '已记入 blocked-last.json');
-      stn('agent', '命令被拦住', 'err');
-      log('拦下并记下「被拦的那一条」（含档位与原因）', 'r');
-      log('Agent 会弹出确认框问你一句 —— 你同意后签发一张本机一次性授权（TTL 600s、单次消费），重试同一条命令即放行一次', 'y');
-      say('推送失败，命令已按 fail-closed 拦截；可签发本机一次性授权后放行一次');
+      stn('agent', '已拦住 · 转调 AskUserQuestion', 'err');
+      log('Agent 读到这一行标记 → 调 <b>AskUserQuestion</b>，用宿主原本的确认框问你一次', 'p');
+      await sleep(T(320));
 
-      $('#grantBtn').style.display = '';
-      $('#grantBtn').focus();
-      $('#runBtn').disabled = false;
-      busy = false;
+      showDlg();
+      log('等待你在宿主的确认框里选…', 'y');
+      say('推送失败，命令已被拦住；请问是否允许执行这条命令？');
+
+      var choice = await waitForVerdict();
+      hideDlg();
+
+      if (choice !== 'allow'){
+        stn('agent', '命令未执行', 'err');
+        log('你选了<b>拒绝</b> → 命令保持拦住，不执行', 'r');
+        log('审计落盘：verdict = <b>deny</b>　decidedBy = ask_user（宿主确认框）', 'p');
+        say('你拒绝了，命令未执行');
+        $('#runBtn').disabled = false;
+        busy = false;
+        return;
+      }
+
+      stn('agent', '已授权这一次', 'on');
+      log('你选了<b>允许这一次</b> → 签发本机一次性授权（TTL 600s · 单次消费）', 'y');
+      say('已授权，正在签发本机一次性授权');
+      await sleep(T(320));
+      await applyGrant();
       return;
     }
 
@@ -750,33 +828,59 @@ footer .fin span{border:1px solid var(--line-soft);border-radius:99px;padding:7p
     $('#runBtn').disabled = false;   // 一次流程走完要把按钮放开，否则只能靠「重置」
   }
 
-  async function grant(){
-    var b = $('#grantBtn');
-    b.disabled = true;
+  // 宿主原生确认框的显示/隐藏。强制 reflow 是为了让每次演示都能重播入场动画。
+  function showDlg(){
+    var d = $('#dlg');
+    d.querySelectorAll('button').forEach(function(b){ b.disabled = false; });
+    d.classList.remove('show');
+    void d.offsetWidth;
+    d.classList.add('show');
+    var first = d.querySelector('button[data-dlg=allow]');
+    if (first) first.focus();
+  }
+  function hideDlg(){ $('#dlg').classList.remove('show'); }
+
+  // 降级第 ① 步收尾：签发本机一次性授权 → 重试同一条命令 → 授权命中，放行一次。
+  async function applyGrant(){
     t0 = Date.now();
-    log('本机一次性授权已签发（TTL 600s · 单次消费 · 绑定到这一条命令）', 'y');
-    await sleep(T(300));
+    stn('gw', '授权已签发', 'on');
+    log('执行 approval confirm --yes --json → 本机一次性授权已签发', 'p');
+    log('　（TTL 600s · 单次消费 · 绑定到这一条命令，绑定号 d9050b）', 'p');
+    await sleep(T(320));
+
     stn('agent', '重试同一条命令', 'on');
     var line = terminal();
     await typeInto(line, CMD, 22);
-    await sleep(T(200));
+    await sleep(T(240));
+
+    stn('gw', '授权命中，随即摘除', 'ok');
     stn('agent', '授权命中 → 放行一次', 'ok');
-    stn('gw', '授权已消费', 'ok');
     log('命中授权，放行<b>一次</b>，随即摘除', 'g');
+    log('命令执行：' + CMD, 'g');
+    await sleep(T(220));
+    log('此后同一条命令仍需重新确认 —— 一次性授权只能消费一次，重放会被拦', 'p');
+    log('审计落盘：local_confirm_used　decidedBy = local', 'p');
     say('本机一次性授权已命中，命令已放行一次');
-    log('命令执行：' + CMD + '（此后同一条命令仍需重新确认）', 'g');
-    b.style.display = 'none';
+    $('#runBtn').disabled = false;
+    busy = false;
   }
 
   $('#runBtn').addEventListener('click', run);
   $('#resetBtn').addEventListener('click', reset);
-  $('#grantBtn').addEventListener('click', grant);
   $('#acts').addEventListener('click', function(e){
     var b = e.target.closest('button[data-verdict]');
     if (!b || b.disabled || !resolver) return;
     var fn = resolver;
     resolver = null;
     fn(b.dataset.verdict);
+  });
+  // 确认框里的选择走同一个 resolver 通道，和手表那两个按钮等价
+  $('#dlg').addEventListener('click', function(e){
+    var b = e.target.closest('button[data-dlg]');
+    if (!b || b.disabled || !resolver) return;
+    var fn = resolver;
+    resolver = null;
+    fn(b.dataset.dlg);
   });
   $('#offline').addEventListener('change', reset);
 

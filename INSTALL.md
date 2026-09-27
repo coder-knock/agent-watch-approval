@@ -16,7 +16,7 @@
  ⑥  拿两个值 + 验往返    令牌、服务名，先真机点一次                    ~5 分钟
  ⑦  切到 HA 通道        config.json → channel:"ha"                   ~1 分钟
  ⑧  接上 Agent          hook + 开机自启 + MCP                 ★自启要普通终端
- ⑨  验收                460 项测试 + 一条行为探针                     ~2 分钟
+ ⑨  验收                498 项测试 + 一条行为探针                     ~2 分钟
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
@@ -273,7 +273,9 @@ approval link --token <刚才创建的令牌>
       "criticalFromTier": "L3",
       "clearAfterDecision": true,
       "publicBaseUrl": "",
-      "phoneAccessKey": ""
+      "phoneAccessKey": "",
+      "renotifySeconds": 0,
+      "renotifyMax": 3
     }
   }
 }
@@ -293,6 +295,9 @@ approval health            # 看 channelReady
 > ⚠️ `timeSensitiveFromTier` / `criticalFromTier` 是「吵醒你」的两个旋钮：
 > `time-sensitive` 穿透专注模式但**不**绕过静音；`critical` **绕过静音**。
 > 关掉 critical 就把 `criticalFromTier` 设成 `null`。详见 `SETUP.md` §1.6.1。
+>
+> `renotifySeconds` / `renotifyMax`：iOS 通知被划走后自动重推的间隔与上限。
+> 默认 `0` 不重推；要开就设非零秒数与上限。详见 `SETUP.md` §1.6.3。
 
 ---
 
@@ -363,13 +368,33 @@ approval tier      # 列出「判为 L2/L3 但执行效果为零」的安全探�
 
 挑首选那条跑一下 → 手机/手表应该收到卡片。
 
-> ⚠️ **`ask` 不是这里的一个可选项。** 在这个构建的 WorkBuddy 里输出 `ask`
-> **等于放行**，所以 `fallbackFor()` 会把它降级成 `deny` 并打一条 stderr 警告。
-> 想「弹个框问一下」，见 `SETUP.md` §2.1.3 的 `approval confirm`。
->
 > ⚠️ **第一次开 hook，保持默认，不要设 `APPROVAL_FALLBACK_*`。** 默认 `deny` 的
 > 意思是「确认没送到你手上 = 不放行」。网关没跑时你会被拒，正确做法是
 > 8.1 让网关自启，**不是**把失败路径改成放行。
+>
+> **推送失败时怎么问你 —— 默认已经配好，不用加任何环境变量。**
+> 默认策略 `ask_user`：hook 仍然输出 `deny`（判定不依赖权限模式），但 reason
+> 首行带 `[approval: action_required=ask_user]` 标记 + 两步指令，Agent 据此调
+> **AskUserQuestion** —— 那是宿主**原本的确认框**。你会被那个框问一次，
+> 选「允许这一次」后 Agent 执行 `approval confirm --yes --json` 并重试同一条命令。
+>
+> 想换别的降级方式，才需要加这个变量：
+>
+> ```
+> APPROVAL_PUSH_FAIL_POLICY=local /opt/homebrew/bin/node /path/to/agent-approval/bin/approve-hook.mjs
+> ```
+>
+> | 值 | 行为 |
+> |---|---|
+> | `ask_user`（**默认**） | 拦住 + 标记 → Agent 用宿主的原生确认框问你 |
+> | `deny` | 纯拦，不给下一步（想自己接管降级流程时用） |
+> | `local` | 转场网关自带的 /phone.html，你在那一页点一下 |
+> | `ask` | 输出 `permissionDecision:"ask"`，把决定交回宿主的权限流程 |
+>
+> ⚠️ 关于 `ask`：它的效果**取决于权限模式** —— 需要审批的场景确实会弹框，
+> 但沙箱快速路径上宿主本来就不问人，`ask` 变不出框、命令照跑。所以它是
+> **显式可选项而不是默认**；默认的 `ask_user` 用「拦住 + 让 Agent 重新问」
+> 达到同样目的，且不赌模式。两层机制详见 `SETUP.md` §2.1.4 与「历史证据」一节。
 
 ### 8.3 MCP：让 Agent 主动问人（可选但推荐）
 
@@ -411,19 +436,19 @@ approval tier      # 列出「判为 L2/L3 但执行效果为零」的安全探�
 ## ⑨ 验收
 
 ```bash
-approval test        # 九套，共 460 项
+approval test        # 八套，共 498 项（另有第九套 MCP 往返需活网关）
 ```
 
 | 套件 | 项数 | 说明 |
 |---|---|---|
 | 风险分级 | 80 | 纯本地 |
-| HA 通道 | 30 | 纯本地（假 fetch） |
-| hook 协议 | 61 | 真起子进程喂 stdin |
+| HA 通道 | 59 | 纯本地（假 fetch） |
+| hook 协议 | 92 | 真起子进程喂 stdin |
 | 本机一次性确认 | 66 | 纯本地（临时目录） |
-| net-doctor | 28 | 纯本地 |
+| net-doctor | 35 | 纯本地 |
 | 设备可收性 | 45 | 纯本地 |
-| 存储容错 | 26 | 纯本地 |
-| 网关自检 | 82 | 临时 mock 配置 |
+| 存储容错 | 29 | 纯本地 |
+| 网关自检 | 92 | 临时 mock 配置 |
 | MCP 往返 | 21 | **需要活的网关** |
 
 **退出码约定**：`0` = 通过，`1` = 真的失败，`2` = 按设计跳过。
@@ -468,7 +493,7 @@ approval audit 5             # 应能看到 decidedBy:"ha" 的记录
 | HA 每隔 2~3 分钟自己重启一次 | 同上。`tail -f ~/.homeassistant/home-assistant.log` 里每条 `aiohttp_fast_zlib` WARNING 就是一次启动，间隔精确到秒即是被看门狗踢的 |
 | 手机搜不到服务器 | `SETUP.md` §1.1.2（`zeroconf` 被砍了？） |
 | 手表上按钮不出现 | `SETUP.md` §1.3（Watch App 没装？） |
-| **手机收到通知了，但通知上没有按钮可点** | **不是故障**：iOS 必须**展开**通知才显示按钮（锁屏上从右往左滑再点「查看」，或长按；不在锁屏时把通知下拉），而 Apple 不给任何视觉线索；**手表反而是直接显示的** —— 所以「手表好用」不代表手机也好用。想让「点一下」就能操作，配 `publicBaseUrl`，见 `SETUP.md` §1.6.2 |
+| **收到通知了，但通知上没有按钮可点** | **不是故障 —— 两个平台都这样**：iOS / watchOS 都把按钮画在**展开层**里。手机上「锁屏右→左滑点『查看』/ 长按 / 非锁屏时下拉」；**手表上要旋转数码表冠把卡片滚到最底部**。Apple 不给任何视觉线索，所以正文尾部那行提示（`expandHint()`）是唯一的自救线索。⚠️ 直接点通知**主体** = 打开 App，**不产生任何决策**（fail-closed 会拦下，看起来像「我同意了它却说没同意」）。想让「点一下」就能操作，配 `publicBaseUrl`，见 `SETUP.md` §1.6.2 |
 | 审计里一堆「超时未确认」，可你根本没收到通知 | 看那条的 `reason` / `source`：`cancelled` + `source=push-failed` 才是「压根没送到」（去查 `approval net` 第 9 项），`expired` + `source=timeout` 才是「送到了、没人点」。两者处置完全不同 |
 | 手机收到了、手表不响 | 屏幕亮着时通知不镜像，按侧边键黑屏再试 |
 | `notify.mobile_app_*` 服务不存在 | `SETUP.md` §1.3.1 → §1.3.2 |
