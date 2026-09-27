@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>腕上确认网关 · 管理面板</title>
+<style>
+  :root {
+    --bg: #0b0d12;
+    --panel: #141821;
+    --border: #1f2532;
+    --text: #e6e8ef;
+    --muted: #8a93a6;
+    --accent: #4f8cff;
+    --allow: #2ec27e;
+    --deny: #e0584f;
+    --pending: #d8a13b;
+    --hover: #1c2230;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Helvetica Neue", "PingFang SC", sans-serif; color: var(--text); background: var(--bg); }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  header h1 { margin: 0; font-size: 16px; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  .toolbar { padding: 12px 20px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .toolbar input, .toolbar select, .toolbar button {
+    background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 6px; font: inherit;
+  }
+  .toolbar input[type=search] { flex: 1; min-width: 200px; }
+  .toolbar button { cursor: pointer; }
+  .toolbar button:hover { background: var(--hover); }
+  .toolbar .chip {
+    display: inline-flex; align-items: center; gap: 4px; padding: 4px 10px;
+    border-radius: 999px; border: 1px solid var(--border); cursor: pointer; user-select: none;
+    background: var(--panel);
+  }
+  .toolbar .chip.active { background: var(--accent); border-color: var(--accent); color: white; }
+  .tabs { display: flex; padding: 0 20px; border-bottom: 1px solid var(--border); }
+  .tabs button {
+    background: none; border: none; color: var(--muted); padding: 10px 14px;
+    cursor: pointer; font: inherit; border-bottom: 2px solid transparent;
+  }
+  .tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+  main { display: grid; grid-template-columns: 1fr 0fr; transition: grid-template-columns 0.15s; }
+  main.detail-open { grid-template-columns: 1fr 380px; }
+  .list { padding: 0; margin: 0; list-style: none; overflow-y: auto; }
+  .list li { padding: 10px 20px; border-bottom: 1px solid var(--border); cursor: pointer; }
+  .list li:hover { background: var(--hover); }
+  .row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .tier { font-weight: 600; font-size: 11px; padding: 1px 6px; border-radius: 4px; min-width: 28px; text-align: center; }
+  .tier-L0 { background: #2a3142; color: var(--muted); }
+  .tier-L1 { background: #283447; color: #93b4e6; }
+  .tier-L2 { background: #2d3a55; color: #b9d2ff; }
+  .tier-L3 { background: #4a2a3a; color: #ffb3c2; }
+  .verdict { font-size: 11px; padding: 1px 6px; border-radius: 4px; }
+  .verdict-allow { background: rgba(46,194,126,0.18); color: var(--allow); }
+  .verdict-deny  { background: rgba(224,88,79,0.18); color: var(--deny); }
+  .verdict-pending { background: rgba(216,161,59,0.18); color: var(--pending); }
+  .verdict-expired { background: rgba(138,147,166,0.18); color: var(--muted); }
+  .meta { color: var(--muted); font-size: 11px; margin-left: auto; }
+  .body { color: var(--text); margin-top: 4px; white-space: pre-wrap; word-break: break-word; max-height: 4em; overflow: hidden; text-overflow: ellipsis; }
+  .tool { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .empty { padding: 40px; text-align: center; color: var(--muted); }
+  .load-more { padding: 12px; text-align: center; color: var(--muted); }
+  .load-more button { background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 8px 18px; border-radius: 6px; cursor: pointer; }
+  aside.detail {
+    border-left: 1px solid var(--border); overflow-y: auto; padding: 16px 18px; background: var(--panel);
+  }
+  aside.detail h2 { margin: 0 0 10px; font-size: 14px; }
+  aside.detail h3 { margin: 16px 0 6px; font-size: 12px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.04em; }
+  aside.detail pre {
+    background: var(--bg); padding: 8px 10px; border-radius: 4px; overflow-x: auto;
+    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0;
+  }
+  aside.detail .close { float: right; background: none; border: none; color: var(--muted); cursor: pointer; font-size: 18px; }
+  .stats { padding: 10px 20px; border-bottom: 1px solid var(--border); display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+  .stats b { color: var(--text); font-weight: 600; }
+  .badge { display: inline-block; padding: 1px 6px; background: var(--hover); border-radius: 4px; font-size: 11px; color: var(--muted); }
+  .err { padding: 14px 20px; color: var(--deny); }
+  .row + .row { margin-top: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>腕上确认网关 · 管理面板</h1>
+  <span class="sub" id="statusLine">就绪</span>
+  <span class="badge" id="timeBadge"></span>
+</header>
+
+<div class="stats" id="statsBar">尚未拉取</div>
+
+<div class="toolbar">
+  <span class="chip active" data-tier="">全部</span>
+  <span class="chip" data-tier="L0">L0</span>
+  <span class="chip" data-tier="L1">L1</span>
+  <span class="chip" data-tier="L2">L2</span>
+  <span class="chip" data-tier="L3">L3</span>
+  <input type="search" id="searchBox" placeholder="搜索命令 / 工具 / binding…" />
+  <select id="statusSel">
+    <option value="">全部状态</option>
+    <option value="pending">待决</option>
+    <option value="decided">已决</option>
+    <option value="expired">过期</option>
+  </select>
+  <input type="datetime-local" id="sinceInput" title="起始时间" />
+  <button id="refreshBtn">刷新</button>
+</div>
+
+<div class="tabs">
+  <button class="active" data-tab="approvals">决策记录</button>
+  <button data-tab="audit">原始事件</button>
+</div>
+
+<main id="main">
+  <ul class="list" id="list"></ul>
+  <aside class="detail" id="detail" hidden></aside>
+</main>
+
+<script type="module">
+// ── 状态 ──────────────────────────────────────────────────────────────────
+const state = {
+  tab: 'approvals',
+  tier: '',
+  q: '',
+  status: '',
+  since: null,
+  offset: 0,
+  limit: 50,
+  hasMore: false,
+  selectedId: null,
+};
+
+// ── 工具 ──────────────────────────────────────────────────────────────────
+const $ = (sel) => document.querySelector(sel);
+const fmt = {
+  ts: (ms) => {
+    if (!ms) return '—';
+    const d = new Date(ms);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  },
+  rel: (ms) => {
+    if (!ms) return '—';
+    const diff = Date.now() - ms;
+    const s = Math.round(diff / 1000);
+    if (s < 60) return `${s}s 前`;
+    if (s < 3600) return `${Math.round(s/60)}m 前`;
+    if (s < 86400) return `${Math.round(s/3600)}h 前`;
+    return `${Math.round(s/86400)}d 前`;
+  },
+  // 显示单行 body —— 替换换行为空格，避免折行错乱。
+  oneline: (s) => String(s || '').replace(/\s+/g, ' ').trim(),
+};
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+const api = (path, opts = {}) =>
+  fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts })
+    .then(async (r) => {
+      if (!r.ok) throw new Error(`${r.status} ${await r.text().catch(() => '')}`);
+      return r.json();
+    });
+
+// ── 主拉取 ────────────────────────────────────────────────────────────────
+async function load({ reset = false } = {}) {
+  if (reset) { state.offset = 0; $('#list').innerHTML = ''; }
+  const params = new URLSearchParams();
+  params.set('limit', String(state.limit));
+  params.set('offset', String(state.offset));
+  if (state.tier) params.set('tier', state.tier);
+  if (state.q) params.set('q', state.q);
+  if (state.tab === 'approvals' && state.status) params.set('status', state.status);
+  if (state.since) params.set('since', String(state.since));
+
+  const path = state.tab === 'approvals'
+    ? `/v1/approvals?${params}`
+    : `/v1/audit?${params}`;
+  try {
+    $('#statusLine').textContent = '拉取中…';
+    const { items = [], limit } = await api(path);
+    state.hasMore = items.length >= (limit || state.limit);
+    renderItems(items, reset);
+    $('#statusLine').textContent = `已加载 ${$('#list').children.length} 项`;
+    $('#timeBadge').textContent = new Date().toLocaleTimeString();
+    // 异步拉 summary（不阻塞列表）
+    loadSummary().catch(() => {});
+  } catch (e) {
+    $('#statusLine').textContent = '错误：' + e.message;
+  }
+}
+
+async function loadSummary() {
+  const params = new URLSearchParams();
+  if (state.since) params.set('since', String(state.since));
+  const data = await api(`/v1/audit/summary?${params}`);
+  const parts = [];
+  parts.push(`共 <b>${data.total}</b> 条事件`);
+  for (const [k, v] of Object.entries(data.byEvent || {})) parts.push(`${k} <b>${v}</b>`);
+  for (const [k, v] of Object.entries(data.byVerdict || {})) parts.push(`${k} <b>${v}</b>`);
+  $('#statsBar').innerHTML = parts.join(' · ');
+}
+
+// ── 渲染 ──────────────────────────────────────────────────────────────────
+function renderItems(items, reset) {
+  const list = $('#list');
+  for (const item of items) {
+    const li = document.createElement('li');
+    li.dataset.id = item.id || item.binding || '';
+    li.innerHTML = state.tab === 'approvals' ? renderApproval(item) : renderAuditEvent(item);
+    li.addEventListener('click', () => openDetail(item));
+    list.appendChild(li);
+  }
+  if (items.length === 0 && reset) {
+    list.innerHTML = '<li class="empty">无匹配记录</li>';
+  }
+  if (state.hasMore) {
+    const more = document.createElement('li');
+    more.className = 'load-more';
+    more.innerHTML = '<button id="loadMoreBtn">加载更多</button>';
+    more.querySelector('button').addEventListener('click', () => {
+      state.offset += state.limit;
+      load({ reset: false });
+    });
+    list.appendChild(more);
+  }
+}
+
+function renderApproval(r) {
+  const tier = r.tier || '?';
+  const verdict = r.verdict ? (r.verdict === 'allow' ? 'allow' : 'deny') : (r.status || 'pending');
+  return `
+    <div class="row">
+      <span class="tier tier-${tier}">${esc(tier)}</span>
+      <span class="verdict verdict-${verdict}">${esc(verdict)}</span>
+      <span class="tool">${esc(r.tool || '')}</span>
+      <span class="meta">${esc(fmt.rel(r.decidedAt || r.createdAt))} · ${esc(fmt.ts(r.decidedAt || r.createdAt))}</span>
+    </div>
+    <div class="body">${esc(fmt.oneline(r.body || r.title || ''))}</div>
+    <div class="row">
+      ${r.latencyMs != null ? `<span class="badge">${Math.round(r.latencyMs)}ms</span>` : ''}
+      ${r.decidedBy ? `<span class="badge">${esc(r.decidedBy)}</span>` : ''}
+      ${r.deviceName ? `<span class="badge">${esc(r.deviceName)}</span>` : ''}
+    </div>`;
+}
+
+function renderAuditEvent(e) {
+  return `
+    <div class="row">
+      <span class="tier tier-${e.tier || 'L0'}">${esc(e.tier || '·')}</span>
+      <span class="badge">${esc(e.event)}</span>
+      <span class="tool">${esc(e.tool || '')}</span>
+      <span class="meta">${esc(fmt.rel(Date.parse(e.ts)))} · ${esc(e.ts)}</span>
+    </div>
+    <div class="body">${esc(e.summary || e.error || e.reason || '')}</div>`;
+}
+
+// ── 详情抽屉 ──────────────────────────────────────────────────────────────
+async function openDetail(item) {
+  state.selectedId = item.id || null;
+  if (!state.selectedId) {
+    renderDetailForEvent(item);
+    return;
+  }
+  $('#detail').hidden = false;
+  $('#main').classList.add('detail-open');
+  $('#detail').innerHTML = '<h2>详情</h2><pre>加载中…</pre>';
+  try {
+    const [approval, trace] = await Promise.all([
+      api(`/v1/approvals/${state.selectedId}`).catch(() => null),
+      api(`/v1/audit/trace/${state.selectedId}`).catch(() => ({ items: [] })),
+    ]);
+    renderDetail(approval, trace.items);
+  } catch (e) {
+    $('#detail').innerHTML = `<h2>详情</h2><pre>${esc(e.message)}</pre>`;
+  }
+}
+
+function renderDetailForEvent(item) {
+  $('#detail').hidden = false;
+  $('#main').classList.add('detail-open');
+  $('#detail').innerHTML = `
+    <button class="close" onclick="document.getElementById('detail').hidden=true;document.getElementById('main').classList.remove('detail-open')">×</button>
+    <h2>审计事件</h2>
+    <pre>${esc(JSON.stringify(item, null, 2))}</pre>`;
+}
+
+function renderDetail(approval, events) {
+  $('#detail').innerHTML = `
+    <button class="close" onclick="document.getElementById('detail').hidden=true;document.getElementById('main').classList.remove('detail-open')">×</button>
+    <h2>审批记录 <span class="badge">${esc(approval?.id || state.selectedId)}</span></h2>
+    ${approval ? `
+    <h3>结果</h3>
+    <pre>${esc(JSON.stringify(approval, null, 2))}</pre>
+    ` : '<p class="empty">记录已不在内存里（网关重启后只保留 audit）</p>'}
+    <h3>审计轨迹（${events.length} 条）</h3>
+    ${events.map((e) => `
+      <div class="row">
+        <span class="badge">${esc(e.event)}</span>
+        <span class="meta">${esc(e.ts)}</span>
+      </div>
+      <pre>${esc(JSON.stringify(e, null, 2))}</pre>
+    `).join('') || '<p class="empty">无关联事件</p>'}`;
+}
+
+// ── 事件 ──────────────────────────────────────────────────────────────────
+document.querySelectorAll('.chip').forEach((chip) => {
+  chip.addEventListener('click', () => {
+    document.querySelectorAll('.chip').forEach((c) => c.classList.remove('active'));
+    chip.classList.add('active');
+    state.tier = chip.dataset.tier || '';
+    load({ reset: true });
+  });
+});
+document.querySelectorAll('.tabs button').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tabs button').forEach((b) => b.classList.remove('active'));
+    btn.classList.add('active');
+    state.tab = btn.dataset.tab;
+    load({ reset: true });
+  });
+});
+let searchTimer = null;
+$('#searchBox').addEventListener('input', (e) => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => { state.q = e.target.value; load({ reset: true }); }, 250);
+});
+$('#statusSel').addEventListener('change', (e) => { state.status = e.target.value; load({ reset: true }); });
+$('#sinceInput').addEventListener('change', (e) => {
+  state.since = e.target.value ? Date.parse(e.target.value) : null;
+  load({ reset: true });
+});
+$('#refreshBtn').addEventListener('click', () => load({ reset: true }));
+
+// 自动刷新一次 + 每 10s 拉一次（不重置 offset，只追加）
+load({ reset: true });
+setInterval(() => {
+  // 只在「已决 / 过期 / 无未读」时静默刷新，否则会盖掉用户的滚动位置
+  state.offset = 0;
+  load({ reset: true });
+}, 10_000);
+</script>
+</body>
+</html>

@@ -41,6 +41,28 @@ port_up()   { lsof -nP -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1; }
 loaded()    { launchctl print "gui/${UID_NUM}/${LABEL}" >/dev/null 2>&1; }
 healthz()   { curl -s --max-time 4 "http://127.0.0.1:$PORT/healthz" 2>/dev/null; }
 
+# 自签 TLS 的 CA 路径（没有就输出空）—— 取自 config.json，配置是单一真源。
+#
+# 为什么必须有这个函数
+# --------------------
+# HA 自 2026-09-20 起在 8123 上启用了 HTTPS，用的是**自签 CA**。
+# node 的 fetch / WebSocket（undici）只认系统根证书，不信任自签 CA，
+# 于是每一次推送都失败，而报错只有一句话 —— `TypeError: fetch failed`
+# （真因 `UNABLE_TO_VERIFY_LEAF_SIGNATURE` 藏在 `err.cause` 里）。
+#
+# 而 NODE_EXTRA_CA_CERTS **只能在进程启动那一刻生效**，没法在代码里补。
+# 所以每条启动路径都得带上它，漏一条 = 那条路径上推送静默失效：
+#   ① launchd（write_plist 生成 plist 时注入）
+#   ② launchctl 不可用时的脱管兜底（spawn_detached 里 export）
+# 实测就踩到过 ② —— 网关当时是脱管跑着的，plist 改了完全不生效。
+#
+# 用 plutil 取值（它在现代 macOS 上能直接读 JSON），避免为了读一个字段
+# 引入 jq / python 依赖。
+ca_file() {
+  [ -f "$DIR/config.json" ] || return 0
+  plutil -extract channels.ha.caFile raw -o - "$DIR/config.json" 2>/dev/null || true
+}
+
 # 清掉任何不在 launchd 名下的网关实例。
 # 必须先做：端口被占时，launchd 拉起的那个会立刻因「地址已在使用」退出，
 # 而 KeepAlive 会让它每 10 秒重试一次 —— 表现为「装好了但一直起不来」。
@@ -61,6 +83,17 @@ kill_stray() {
 
 write_plist() {
   mkdir -p "$LOGDIR"
+
+  # 自签 TLS 的 CA —— 见下面 ca_file() 的说明。
+  # 这段必须由本函数自己生成：`install` 会**整个重写** plist，
+  # 手工往 plist 里加的变量会被无声冲掉（踩过一次）。
+  local ca ca_block=""
+  ca="$(ca_file)"
+  if [ -n "$ca" ]; then
+    ca_block="        <key>NODE_EXTRA_CA_CERTS</key>
+        <string>${ca}</string>"
+  fi
+
   cat > "$PLIST" <<PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -83,6 +116,7 @@ write_plist() {
     <dict>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+${ca_block}
     </dict>
 
     <key>LimitLoadToSessionType</key>
@@ -126,6 +160,19 @@ PLISTEOF
 spawn_detached() {
   local log="$LOGDIR/gateway-detached.log"
   mkdir -p "$LOGDIR"
+
+  # HA 用自签证书时，必须在这里注入 CA —— 脱管进程不读 plist，
+  # 不注入就等于推送一直报「fetch failed」而看不出原因。见 ca_file()。
+  local ca
+  ca="$(ca_file)"
+  if [ -n "$ca" ]; then
+    if [ -f "$ca" ]; then
+      export NODE_EXTRA_CA_CERTS="$ca"
+    else
+      c_warn "config 里的 caFile 不存在：$ca（HTTPS 会握手失败）"
+    fi
+  fi
+
   /usr/bin/python3 "$DIR/scripts/run-detached.py" \
     --cd "$DIR" --log "$log" -- "$NODE" "$DIR/src/gateway.mjs" >/dev/null 2>&1 || true
   local i

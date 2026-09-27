@@ -14,27 +14,82 @@ import {
   deviceSlugFromNotifyService,
   assessDeviceReadiness,
   explainUnreachable,
+  diagnoseHaUnreachable,
 } from './device-readiness.mjs';
 
-// ── iOS 通知按钮的可发现性 ───────────────────────────────────────────────────
+// ── iOS / watchOS 通知按钮的可发现性 ─────────────────────────────────────────
 //
-// iOS **不会**默认把动作按钮画到通知上：必须展开才看得见 ——
-// 锁屏上「左滑 → 点『查看』」，或长按，或（非锁屏时）把通知往下拉。
-// 而 Apple 不给任何视觉线索（可操作通知和普通通知长得一模一样），
-// 于是现象就是「HA 收到通知了，但没有按钮可点」；
-// 与此同时 Apple Watch 是**直接显示**按钮的 —— 所以会出现
-// 「手表上一直好用、手机上找不到按钮」，最容易被误判成 bug 的正是这一条。
+// **两个平台都不把动作按钮画在通知正面**，都得先「展开」，只是手势不一样：
 //
-// 官方文档原话：All devices support notification expanding by performing a
-// right to left swipe and pressing 'View' in the lock screen or pressing and
-// holding. If you're not in the lock screen, you can also pull the
-// notification down to expand it.
+//   · iPhone —— 锁屏上「右→左滑 → 点『查看』」，或**长按**；
+//               不在锁屏时把通知**下拉**。
+//     官方原话：All devices support notification expanding by performing a
+//     right to left swipe and pressing 'View' in the lock screen or pressing
+//     and holding. If you're not in the lock screen, you can also pull the
+//     notification down to expand it.
 //
-// 把提示写进正文是唯一能让用户自己发现的途径（Apple 没有别的钩子可挂）。
+//   · Apple Watch —— **旋转数码表冠向下滚到长视图底部**，按钮在底部。
+//     官方原话：「旋转数码表冠以滚动到通知底部，然后轻点底部的一个按钮」；
+//     Apple Developer 对长视图的分层描述也是「**底部**包含『关闭』按钮和
+//     所有已注册的操作按钮」。
+//
+// ⚠️ 这里原先写着「Apple Watch 是**直接显示**按钮的」——**那是错的**。
+// 2026-09-20 真机推翻：在手表上点通知卡片，得到的是「打开了 HA App」，
+// 不是按钮列表 —— 因为按钮在长视图底部，没滚到那儿就是看不见。
+// 「手表直接显示」这个臆测还派生出一条更糟的推论「手表好用不代表手机好用」，
+// 一并作废：**两边一样难发现，只是手势不同**。
+//
+// ⚠️ 真正危险的还不是「找不到按钮」，而是**用户以为自己点过了**：
+// 点「通知主体」（而不是按钮）时，Apple 触发的是 UNNotificationDefaultActionIdentifier
+// ——系统关掉通知、**直接启动 App**，不经过任何 action。网关侧什么都没收到，
+// fail-closed 于是拦下。在用户眼里就成了「我明明同意了，它却说没同意」。
+//
+// 两个平台都不给任何视觉线索（可操作通知和普通通知长得一模一样），
+// 所以**把提示写进正文**是唯一能让用户自己发现的途径（Apple 没有别的钩子可挂）。
+// ⚠️ 提示必须同时覆盖手机和手表：同一条正文两边都会显示，而两边手势不同。
 export function expandHint(options) {
   const opts = Array.isArray(options) ? options : [];
   if (!opts.length) return '';
-  return `\n长按这张卡片 → 展开「${opts.map((o) => o.label).join(' / ')}」`;
+  return `\n按钮在卡片底部：手机长按展开，手表转表冠滚到底 → 「${opts.map((o) => o.label).join(' / ')}」`;
+}
+
+// ── 「点了通知，却没有产生决策」──────────────────────────────────────────────
+//
+// 通知上点下去**不一定**是按钮。Apple 的长视图有三种落点，只有第一种才是决策：
+//
+//   · 操作按钮          → 报**所选操作**的标识符        ← 只有这个能推进决策
+//   · 「忽略」按钮      → `UNNotificationDismissActionIdentifier`
+//   · 卡片的**其他地方** → `UNNotificationDefaultActionIdentifier`
+//
+// 第三种是**最危险的误判源**：系统关掉通知、**直接启动 App**，用户主观上
+// 「我点过这张卡片了」，但实际没有任何 action 产生 → 网关什么都没收到 →
+// fail-closed 拦下 → 用户看到的是「我明明同意了，它却说没同意」。
+//
+// 更糟的是这两个字面量是**普通字符串**，HA 原样塞进 event 的 `action` 字段，
+// 于是落进 gateway 的 `!startsWith('APR:')` 分支被**静默忽略** ——
+// 一条 `{ ok: true, ignored }` 扔掉，日志里一个字都没有。
+// 这正是本项目修过两次的同一个模式（参见 `fetch failed` 那次）：
+// **错误被压成一个没有信息量的成功返回**。所以这里把落点翻译成人话，
+// 在忽略之前先说出来。
+//
+// 识别不了也不算错：那是别的 App / 别的自动化发的动作，如实说明即可。
+const DEFAULT_ACTION = 'com.apple.UNNotificationDefaultActionIdentifier';
+const DISMISS_ACTION = 'com.apple.UNNotificationDismissActionIdentifier';
+
+export function describeForeignAction(action) {
+  const a = String(action == null ? '' : action);
+  if (a === DEFAULT_ACTION) {
+    // ⚠️ 这里**不要**写 Markdown 的 `**粗体**` —— 这段文字是直接进 console 的，
+    // 星号会原样打出来。同一条文案若还要给文档用，另写一份短的。
+    return '这是「点了通知主体」（不是按钮）触发的默认动作：系统据此打开了 App，'
+      + '没有产生任何决策。要决策，请展开卡片后点按钮 —— '
+      + '手机长按展开，手表转数码表冠滚到卡片底部。';
+  }
+  if (a === DISMISS_ACTION) {
+    return '这是「忽略 / 划掉通知」触发的动作：通知被关闭了，没有产生任何决策。';
+  }
+  return '不是本网关签发的一次性令牌，也不是已知的 iOS 通知落点 —— '
+    + '可能是别的 App 或自动化发的，与本网关无关。';
 }
 
 // SF Symbols 图标（需 iOS App ≥ 2021.10）。只在按钮展开后可见，
@@ -157,7 +212,7 @@ export function create(cfg, deps) {
         // actionName 是「旧事件」的字段名，留着是为了兼容。
         const action = d.action || d.actionName;
         if (action) {
-          deps.onDecision(action, {
+          const out = deps.onDecision(action, {
             source: 'ha',
             // ⚠️ 这里**刻意不读** sourceDeviceName / triggerSource —— 这个事件上根本没有这两个字段。
             //
@@ -180,6 +235,19 @@ export function create(cfg, deps) {
             // 安全上不依赖这个字段：认的是 action 里那个一次性令牌 + HMAC 验签。
             deviceName: null,
           });
+          // ⚠️ 这个返回值**以前是丢掉的** —— 而它恰好是「用户点了通知、
+          // 却什么都没发生」的唯一线索：gateway 对非 `APR:` 的 action 返回
+          // `{ ok: true, ignored: '非本网关的 action' }`，一条成功返回扔掉，
+          // 日志里一个字都没有。见 describeForeignAction 的注释。
+          //
+          // 只处理 `ignored` 这一种：真正的拒绝（签名不符 / 令牌重放）store
+          // 已经连原因一起记进审计日志了，这里再说一遍只会把日志弄乱。
+          if (out && out.ignored) {
+            console.log(
+              `[ha] 收到一个不产生决策的动作，已忽略：${action}\n`
+              + `     ↳ ${describeForeignAction(action)}`
+            );
+          }
         }
         return;
       }
@@ -243,9 +311,12 @@ export function create(cfg, deps) {
         value = assessDeviceReadiness(await res.json(), slug);
       }
     } catch (e) {
+      // 别只写 `e.message`：undici 把所有底层错误都压成「fetch failed」，
+      // 真因在 `e.cause` 里。这里换成一个会主动探测「HA 在哪个协议上」的诊断，
+      // 把「协议不匹配 / 自签证书不受信 / 端口没人听」分清楚。
       value = {
         slug, liveness: [], context: [], entitiesSeen: 0, reporting: null,
-        reason: `连不上 HA（${e.message}），判不了设备状态。`,
+        reason: await diagnoseHaUnreachable(baseUrl, e),
       };
     }
 

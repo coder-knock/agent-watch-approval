@@ -6,32 +6,39 @@
 // 请在 workbuddy 弹出选项供确认」。
 //
 // 直觉做法是让 hook 输出 `permissionDecision: "ask"` —— 语义上正好是
-// 「交给宿主的原生权限框」。**但在本构建的 WorkBuddy 里这条路不通。**
-// 两份独立代码 + 一次活体 A/B 都指向同一结论：
+// 「交给宿主的原生权限框」。这条路**是通的**，而且现在就是默认档位行为
+// （L2 推送失败 → ask，见 bin/approve-hook.mjs 的 RAW_FALLBACK 那一段）。
 //
+// ⚠️ 这里曾经写着一个**反过来的结论**，值得留着当教训 —— 它一度把 ask 整个弃用：
+//
+//   「本构建的 WorkBuddy 不实现 ask，输出 ask 等于静默放行」，依据是
 //   HookExecutor.parseHookOutput():
 //     let ep = { allowed: 0 === eA, ... };        // 初值 = 「exit 0 即 allowed」
 //     "deny"  === decision ? (ep.allowed = false)
 //   : "allow" === decision && (ep.allowed = true);  // ← "ask" 没有分支
 //
-//   SessionToolManager.executePreToolUseHooks():
-//     let ed = eu.allowed;
-//     "deny" === el ? ed = false : "allow" === el && (ed = true);   // ← 同样漏掉 ask
-//     return { allowed: ed, ... };                // 调用方只读 .allowed
+//   **这段代码是真的，但它只说明「hook 层不拦」，不能推出「宿主不拦」。**
+//   ask 的处置发生在更上层：
+//     · SdkHooksManager.aggregateResults() 有显式 ask 分支（且 deny 优先于 ask）；
+//     · HandleInterruptions() 把我们的 reason 注入原生确认框的 providerData →
+//       真的会弹框（`Approval dialog shown for tool: …`）；
+//     · hasForcedAskDecision() / canAutoApproveInBypassMode() 用 ask **阻止**
+//       bypass 模式与缓存批准的自动放行；
+//     · headless(-p) 走 denyForNonInteractive() → ask 落成 deny（fail-closed）。
+//   完整证据链与反读出处见 bin/approve-hook.mjs 头部。
 //
-//   （另：两处的 catch 都是 `{ allowed: true }` —— hook 自己崩了也是放行。）
+//   代价很实在：那个结论把「网关断了还能走宿主原本那套确认」这条路堵掉了，
+//   于是所有推送失败都只能拦住 —— 用户看到的就是「只有提醒，不能确认」。
 //
-// 也就是说：settings.json 里的 command 型 hook 只有两种有效结果 ——
-//   `deny` → 拦住；**其余一切（`ask` / 空输出 / 崩溃）→ 放行**。
-// `ask` 不但不弹框，反而等于静默放行。活体实测：L2 探针（`git push`）
-// 在推送必然失败的情况下照常执行；L3 探针（`rm -rf <不存在路径>`）被拦住。
+// 那这个文件还留着干什么？—— 它承担的是**另一件事**：'ask' 只能让你「重新被问一次」，
+// 而「允许这一次」这个决定需要一个落点，否则你点了允许、Agent 重试时又会被拦。
+// 于是有了这张表，它是兜底顺序里的第 ① 步：
+//   ① 查 data/local-grants.json 里的一张本机一次性授权 → 命中就 allow；
+//   ② 没有 → 交回宿主原生确认框（ask）；
+//   ③ 你选「允许这一次」→ Agent 跑 `approval confirm` 落一张一次性授权；
+//   ④ 重试同一条命令时回到 ①，命中 → allow（且只能消费一次）。
 //
-// 所以「给用户一个选项」只能这么实现：
-//   ① hook 拦住（fail-closed），并让 **Agent 去调 AskUserQuestion**
-//      —— 那是 WorkBuddy 真正的原生弹框（日志里的
-//      `[HandleInterruptions] Approval dialog shown for tool: AskUserQuestion`）；
-//   ② 用户选「允许这一次」→ Agent 跑 `approval confirm` 落一张一次性授权；
-//   ③ 重试同一条命令时，hook 在推送**之前**先查这张表 → 命中就 allow。
+// 一句话分工：**ask 负责「再问你一次」，这张表负责「记住你刚才那次答复」。**
 //
 // 这张表**不是安全边界**
 // ----------------------

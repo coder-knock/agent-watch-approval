@@ -22,6 +22,7 @@ import {
   buildActionId, parseActionId,
 } from './core/bind.mjs';
 import { createChannel, availableChannels } from './channels/index.mjs';
+import * as macAlert from './core/mac-alert.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -304,11 +305,47 @@ async function createApproval(input) {
         deviceOffline: pushResult.deviceOffline === true,
       });
       console.error(`[push] 通道 ${channel.name} 推送失败：${pushResult.detail || '未给原因'}`);
+      // Mac 侧本地提醒：让用户在自己 Mac 上**当场**就知道推送没成功。
+      //
+      // 失败模式不止一种，对应不同的可执行下一步。subtitle 写动作而不是结论，
+      // 用户看到就能照着做 —— 详见 src/core/mac-alert.mjs 头注释（那条要
+      // 自己知道「自己看不看得到通知」的哲学）。
+      //
+      // 异步、绝不阻塞 push 决定：pushResult 已经定了，通知只是补一条提醒。
+      // 失败也绝不抛 —— module 内部已经把每一种失败都收敛到 { shown:false }，
+      // 让调用方不需要 try/catch。
+      const why = pushResult.deviceOffline === true
+        ? 'Apple Watch 不在 HA 范围内'
+        : classifyPushFailure(pushResult) === 'push_5xx'
+        ? 'HA 推送服务 5xx'
+        : '推送失败（详见 /admin.html 与 data/audit.jsonl）';
+      Promise.resolve().then(() => {
+        try {
+          macAlert.notify({
+            title: `腕上确认没送到 · ${tier}`,
+            body: `「${record.title}」推不到手机。${why}。`,
+            subtitle: 'Run `approval audit` 或打开 /admin.html',
+            activateApp: process.env.APPROVAL_MAC_ACTIVATE_APP,
+          });
+        } catch { /* 提醒失败不影响审批本身 */ }
+      });
     }
   } catch (e) {
     pushResult = { ok: false, detail: e.message };
     store.audit({ event: 'push_failed', id, tier, error: e.message, channel: channel.name });
     console.error(`[push] 通道 ${channel.name} 推送失败：${e.message}`);
+    // 异常路径（channel.push 抛错）也提醒 —— 这是最常被忽视的失败面：
+    // 用户看到一条命令被莫名其妙 deny 了，却没人告诉他「推送根本没成功」。
+    Promise.resolve().then(() => {
+      try {
+        macAlert.notify({
+          title: `腕上确认没送到 · ${tier}`,
+          body: `通道 ${channel.name} 抛错：${e.message.slice(0, 120)}`,
+          subtitle: 'Run `approval audit` 或打开 /admin.html',
+          activateApp: process.env.APPROVAL_MAC_ACTIVATE_APP,
+        });
+      } catch { /* ignore */ }
+    });
   }
 
   // 推送成功了才值得补推 —— 推都没推出去的话，补推也只是重复失败。
@@ -365,6 +402,75 @@ function readBody(req) {
   });
 }
 
+/** 把 ?limit= 这种字符串裁到 [lo, hi]，非法值用 fallback。 */
+function clampInt(raw, lo, hi, fallback) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  const i = Math.trunc(n);
+  if (i < lo) return lo;
+  if (i > hi) return hi;
+  return i;
+}
+
+/**
+ * 把 ?since= 与 ?before= 翻译成 epoch ms。
+ * 支持：epoch ms（数字串）或 ISO 8601（`2026-09-20T08:00:00Z`）。
+ * 解析失败返回 null（不是 NaN —— 上层据此「不过滤」而不是「全部拒绝」）。
+ */
+function parseTs(raw) {
+  if (raw == null || raw === '') return null;
+  const n = Number(raw);
+  if (Number.isFinite(n) && n > 1e10) return n;
+  const d = Date.parse(String(raw));
+  return Number.isFinite(d) ? d : null;
+}
+
+/**
+ * 把通道给出的推送失败原因归类成稳定标签，给 hook 与管理面板用。
+ * 失败模式不止一种：「设备掉线」与「HA 500」的处置方向不一样 —— 前者
+ * 几乎是网络问题（Apple Watch 不在身边），后者可能是服务挂掉。两种
+ * 都不算「用户拒绝」，但 hook 输出的「下一步」措辞应当不一样。
+ *
+ * 返回的字符串都是稳定的，hook 与文档都可以靠它做模式匹配：
+ *   'device_offline'    —— 设备没在连（手机掉线 / 蜂窝 / 飞行模式）
+ *   'push_4xx'          —— 通知服务 4xx（参数错 / 鉴权）
+ *   'push_5xx'          —— 通知服务 5xx（HA / 推送通道内部错）
+ *   'channel_error'     —— 其他网络 / fetch 失败
+ *   'unknown'           —— 兜底
+ */
+function classifyPushFailure(pushResult) {
+  if (!pushResult || pushResult.ok !== false) return null;
+  if (pushResult.deviceOffline === true) return 'device_offline';
+  const detail = String(pushResult.detail || '');
+  const codeMatch = detail.match(/返回 (\d{3})/);
+  const code = codeMatch ? Number(codeMatch[1]) : null;
+  if (code != null) {
+    if (code >= 400 && code < 500) return 'push_4xx';
+    if (code >= 500 && code < 600) return 'push_5xx';
+  }
+  if (/超时|fetch failed|ECONNREFUSED|ENOTFOUND|ECONNRESET/i.test(detail)) return 'channel_error';
+  return 'unknown';
+}
+
+/**
+ * 静态文件服务 —— 用来发 /admin.html 与 /phone.html。
+ * 路径白名单：只能落在 public/ 下，禁止用 `..` 跳出。
+ */
+function serveStatic(res, filePath) {
+  const publicDir = path.resolve(__dirname, '..', 'public');
+  const safe = path
+    .resolve(publicDir, filePath.replace(/^\/+/, ''))
+    .replace(/\\/g, '/');
+  if (!safe.startsWith(publicDir + '/') && safe !== publicDir) {
+    return sendJson(res, 403, { error: '越界' });
+  }
+  if (!fs.existsSync(safe)) return sendJson(res, 404, { error: '缺少 ' + filePath });
+  const ext = path.extname(safe).toLowerCase();
+  res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
+  fs.createReadStream(safe).pipe(res);
+  return true;
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, baseUrl);
   const p = url.pathname;
@@ -385,6 +491,24 @@ const server = http.createServer(async (req, res) => {
       if (!fs.existsSync(file)) return sendJson(res, 404, { error: '缺少 public/phone.html' });
       res.writeHead(200, { 'Content-Type': MIME['.html'] });
       return res.end(fs.readFileSync(file));
+    }
+
+    // 管理面板：浏览器查看历史推送与决策结果。
+    //
+    // 共用 phoneAccessKey 的口令。理由和 phone.html 一样 —— actionId 才是
+    // 「能决策」的凭证，挡页面够用；管理面板里没有任何能发起决策的按钮，
+    // 所以即使有人打开页面，也只能「看」，不能「干」。
+    //
+    // 数据来源：`/v1/approvals` / `/v1/audit` / `/v1/audit/summary` /
+    // `/v1/audit/trace/:id` —— 前端 JS 自行拉取，零服务端渲染。
+    if (req.method === 'GET' && p === '/admin.html') {
+      const phoneKey = ((cfg.channels || {}).ha || {}).phoneAccessKey || '';
+      if (phoneKey && url.searchParams.get('k') !== phoneKey) {
+        return sendJson(res, 401, {
+          error: '这个管理面板需要口令：请在地址后加 ?k=<phoneAccessKey>',
+        });
+      }
+      return serveStatic(res, 'admin.html');
     }
 
     if (req.method === 'GET' && p === '/healthz') {
@@ -415,20 +539,36 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && p === '/v1/approvals') {
-      const status = url.searchParams.get('status');
-      const items = store.list(status).slice(0, 100).map((r) => ({
+      const limit = clampInt(url.searchParams.get('limit'), 1, 500, 100);
+      const offset = clampInt(url.searchParams.get('offset'), 0, 1_000_000, 0);
+      const items = store.queryApprovals({
+        status: url.searchParams.get('status') || undefined,
+        tier: url.searchParams.get('tier') || undefined,
+        since: parseTs(url.searchParams.get('since')),
+        before: parseTs(url.searchParams.get('before')),
+        q: url.searchParams.get('q') || undefined,
+        limit,
+        offset,
+      }).map((r) => ({
         id: r.id,
         tier: r.tier,
         title: r.title,
         body: r.body,
         status: r.status,
         verdict: r.verdict || null,
+        decidedOptionId: r.decidedOptionId || null,
+        decidedBy: r.decidedBy || null,
+        deviceName: r.deviceName || null,
+        latencyMs: r.latencyMs || null,
+        tool: r.tool,
+        binding: r.binding,
         createdAt: r.createdAt,
+        decidedAt: r.decidedAt || null,
         expiresAt: r.expiresAt,
         remainingMs: r.status === 'pending' ? Math.max(0, r.expiresAt - Date.now()) : 0,
         options: r.options.map((o) => ({ id: o.id, label: o.label, actionId: o.actionId })),
       }));
-      return sendJson(res, 200, { items });
+      return sendJson(res, 200, { items, limit, offset });
     }
 
     const mGet = p.match(/^\/v1\/approvals\/([A-Za-z0-9_-]+)$/);
@@ -469,6 +609,8 @@ const server = http.createServer(async (req, res) => {
             binding: settled.binding, latencyMs: settled.latencyMs || 0,
             decidedBy: settled.decidedBy || 'push-failed', deviceName: null,
             pushOk: false, pushDetail: pushResult.detail,
+            deviceOffline: pushResult.deviceOffline === true,
+            pushFailureReason: classifyPushFailure(pushResult),
             failedFast: true,
           });
         }
@@ -484,13 +626,31 @@ const server = http.createServer(async (req, res) => {
           binding: final.binding, latencyMs: final.latencyMs,
           decidedBy: final.decidedBy, deviceName: final.deviceName,
           pushOk: pushResult.ok, pushDetail: pushResult.detail,
+          deviceOffline: pushResult.deviceOffline === true,
+          pushFailureReason: classifyPushFailure(pushResult),
         });
       }
 
+      // ⚠️ 必须回 verdict / optionId，否则「本会话内允许」会把命令**拒掉**。
+      //
+      // 命中「本会话内允许」时，上面的 createApproval 已经直接结算（不推送），
+      // 返回的 record.status 就不再是 pending 了。而 hook 判定结论**只看这两个字段**：
+      // 它见 status !== 'pending' 且 verdict !== 'allow'，就当成「被拒」，
+      // 打印 `已拒绝（未知）` 并拦下命令。
+      //
+      // 现象因此极具误导性：用户在手机上点了「本会话内允许」，此后**该会话每条 L2
+      // 都被拒**，报错却只写「未知」；同时网关审计里记的是 `settled / allow /
+      // source=session-allow` —— 两侧对同一条记录的理解完全相反，光看任一侧都查不出来。
+      //
+      // 对比上面 wait>0 的两个分支（push-failed 与 timeout 路径）：它们都带了这两个字段。
+      // 漏的只是 `wait: 0` 这一条，而 hook 恰好固定用 wait: 0。
       return sendJson(res, 202, {
         id: record.id, tier: record.tier, status: record.status,
+        verdict: record.verdict || null, optionId: record.decidedOptionId || null,
         binding: record.binding, expiresAt: record.expiresAt,
         pushOk: pushResult.ok, pushDetail: pushResult.detail,
+        deviceOffline: pushResult.deviceOffline === true,
+        pushFailureReason: classifyPushFailure(pushResult),
       });
     }
 
@@ -570,8 +730,32 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && p === '/v1/audit') {
-      const limit = Number(url.searchParams.get('limit') || 50);
-      return sendJson(res, 200, { items: store.readAudit(limit) });
+      const limit = clampInt(url.searchParams.get('limit'), 1, 500, 100);
+      const offset = clampInt(url.searchParams.get('offset'), 0, 1_000_000, 0);
+      const items = store.queryAudit({
+        event: url.searchParams.get('event') || undefined,
+        tier: url.searchParams.get('tier') || undefined,
+        since: parseTs(url.searchParams.get('since')),
+        before: parseTs(url.searchParams.get('before')),
+        id: url.searchParams.get('id') || undefined,
+        limit,
+        offset,
+      });
+      return sendJson(res, 200, { items, limit, offset });
+    }
+
+    // 聚合统计 —— 给管理面板顶部那一行计数器用。
+    if (req.method === 'GET' && p === '/v1/audit/summary') {
+      const since = parseTs(url.searchParams.get('since'));
+      const before = parseTs(url.searchParams.get('before'));
+      return sendJson(res, 200, store.summarizeAudit({ since, before }));
+    }
+
+    // 一条 approval 的全部审计事件（按时间正序）—— 详情抽屉用。
+    const mTrace = p.match(/^\/v1\/audit\/trace\/([A-Za-z0-9_-]+)$/);
+    if (req.method === 'GET' && mTrace) {
+      const items = store.auditTrailFor(mTrace[1]);
+      return sendJson(res, 200, { items });
     }
 
     // 让「本机一次性确认」也能在统一审计里留痕。
@@ -581,11 +765,23 @@ const server = http.createServer(async (req, res) => {
     // 但**「有人用本地确认放行了什么」必须事后可查** —— 可见性才是这条路的防线，
     // 所以 confirm 与 hook 都会 best-effort 地往这里补一条。
     //
-    // 只认三个固定事件名，避免这个端点退化成「谁都能往审计里写任意内容」。
+    // 只认五个固定事件名，避免这个端点退化成「谁都能往审计里写任意内容」。
     // 它不参与任何判定，写失败也不影响放行 —— 纯粹是留痕。
+    //
+    // 后两个是 2026-09-20 加的，对应「推送失败之后怎么走」的两条新路径：
+    //   `local_handoff`     —— 转场到本地审批页，你在浏览器上点。
+    //   `handback_to_host`  —— 交回宿主原生确认框（hook 输出 ask）。
+    // 「这一次为什么没走手表」必须可查 —— 否则事后翻审计只会看到一条
+    // decided，分不出它是在腕上点的、在浏览器上点的、还是宿主弹框点的。
     if (req.method === 'POST' && p === '/v1/audit') {
       const body = await readBody(req);
-      const allowed = ['local_confirm_issued', 'local_confirm_used', 'local_confirm_rejected'];
+      const allowed = [
+        'local_confirm_issued',
+        'local_confirm_used',
+        'local_confirm_rejected',
+        'local_handoff',
+        'handback_to_host',
+      ];
       const event = String(body.event || '');
       if (!allowed.includes(event)) {
         return sendJson(res, 400, { error: `event 必须是 ${allowed.join(' / ')}` });
@@ -657,6 +853,66 @@ function reportFatal(kind, err) {
 }
 process.on('uncaughtException', (err) => reportFatal('uncaughtException', err));
 process.on('unhandledRejection', (err) => reportFatal('unhandledRejection', err));
+
+// ── 端口冲突：明确退出，别变成僵尸 ─────────────────────────────────────────
+//
+// 实测踩过（audit.jsonl 里留了一条）：
+//   gateway_error | Error: listen EADDRINUSE: address already in use 127.0.0.1:7798
+//
+// 原先后台没有 `error` 处理器，于是它冒成 uncaughtException，被上面的
+// reportFatal 接住 —— 而 reportFatal 的职责是「**继续跑，别退出**」。
+// 对一个 listen 失败的进程来说，这个处置恰好是最坏的：
+//
+//   · 进程活着，但**不监听任何端口** → 所有 hook 都拿到「网关不可达」
+//   · 往 audit.jsonl 里持续写 gateway_error，污染审计
+//   · 如果它是 launchd 托管的，`KeepAlive` 看到「进程还在」就不会重启，
+//     于是真正对外服务的永远是那个旧的、可能是旧代码的实例
+//
+// 正确的分叉是两件事，不能混：
+//   A. 端口上已经有一个**健康的网关** → 这就是「重复启动」，安静退出（码 0），
+//      并说清「在跑的是谁、PID 多少」。重复启动不是错误。
+//   B. 端口被**别的程序**占着 → 这是真故障，必须喊出来并退出（码 1），
+//      否则 launchd 的 KeepAlive 会每 10 秒重试一次、刷爆日志且永远起不来。
+//
+// 区分 A/B 靠一次 /healthz 探测 —— 只看「端口被占」是分不出来的。
+async function probeGatewayAt(port) {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/healthz`, {
+      signal: AbortSignal.timeout(2500),
+    });
+    if (!res.ok) return null;
+    const j = await res.json();
+    // 认形状而不是认状态码：我们自己的 /healthz 一定带 channel + pending。
+    return j && typeof j.channel === 'string' && 'pending' in j ? j : null;
+  } catch {
+    return null;
+  }
+}
+
+server.on('error', async (err) => {
+  if (!err || err.code !== 'EADDRINUSE') {
+    reportFatal('server.error', err);
+    return;
+  }
+
+  const other = await probeGatewayAt(PORT);
+  console.error('');
+  if (other) {
+    console.error(`  已经有网关在 ${cfg.host || '127.0.0.1'}:${PORT} 上跑了，这次是重复启动。`);
+    console.error(`  ├─ 在跑的那个   通道 ${other.channel}｜待确认 ${other.pending}`);
+    console.error(`  └─ 本次启动     退出（码 0，重复启动不算错误）`);
+    console.error('  要换掉在跑的那个：bash scripts/gateway-service.sh restart');
+    console.error('');
+    process.exit(0);
+  }
+
+  console.error(`  ❌ 端口 ${PORT} 被**别的程序**占着，而且它不响应 /healthz。`);
+  console.error('     本次启动退出（码 1）—— 继续跑只会变成一个不监听的僵尸进程。');
+  console.error(`     查是谁占着：/usr/sbin/lsof -nP -iTCP:${PORT} -sTCP:LISTEN`);
+  console.error('     或改端口：   config.json 的 "port"');
+  console.error('');
+  process.exit(1);
+});
 
 server.listen(PORT, cfg.host || '127.0.0.1', async () => {
   console.log('');

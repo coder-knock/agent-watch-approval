@@ -24,7 +24,9 @@
       "criticalFromTier": "L3",
       "clearAfterDecision": true,
       "publicBaseUrl": "",
-      "phoneAccessKey": ""
+      "phoneAccessKey": "",
+      "renotifySeconds": 0,
+      "renotifyMax": 3
     },
     "pushcut": {
       "webhookUrl": "https://api.pushcut.io/XXXX/notifications/Agent",
