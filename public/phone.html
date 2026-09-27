@@ -118,12 +118,68 @@ async function decide(actionId, label) {
     const j = await r.json();
     toast(j.ok ? `已提交「${label}」：${j.verdict === 'allow' ? '放行' : '拒绝'}` : `被拒绝：${j.message}`,
       j.ok ? 'ok' : 'bad');
+    if (j.ok) tryCloseTab();
   } catch (e) {
     toast('提交失败：' + e.message, 'bad');
   } finally {
     inflight.delete(actionId);
     render();
   }
+}
+
+// 关掉当前页/标签页。三条路径按可用性优先级回退。
+//
+// 为什么不在这里直接 window.close()：iOS 上**所有**浏览器都跑在 WKWebView
+// 里（Apple 不允许第三方引擎），所以 `window.close()` 在 iOS Safari、Edge、
+// Chrome、Firefox 一律受限 —— 只有 `window.open()` 打开的子窗口才允许被脚本
+// 关掉。从 iOS 通知点 url 跳进来的标签页 / macOS Safari「在标签页组中打开」
+// 都报 `Scripts may close only the windows that were opened by them`。
+//
+// 试过的失败路径（按被采纳顺序）：
+//   ① window.close() —— iOS 所有浏览器均拒；macOS Safari 的标签页组也拒
+//   ② history.back() —— 通知直接 push 这个 URL，没有前一页，back 等于不变
+//   ③ location.replace('about:blank') —— 显示空白页，**不**退到调用方
+//
+// 实测可用的两条：
+//   A. macOS / Android：window.close() 通常直接成功
+//   B. iOS 任意浏览器：先试 window.close()（Edge iOS 偶尔放行），失败就
+//      跳到一个「无操作」的占位页，让用户自己点浏览器的「完成」/上滑关闭
+//      —— 在 iOS 上这一动作比"被关掉"更符合用户预期，且无 SecurityError。
+function tryCloseTab() {
+  const ua = navigator.userAgent || '';
+  const isiOS = /iPhone|iPad|iPod/i.test(ua);
+
+  // 桌面 / Android：直接关
+  if (!isiOS) {
+    try { window.close(); } catch (_) { /* 忽略：标签页组等场景仍会拒 */ }
+    setTimeout(() => {
+      if (!document.hidden) showDonePlaceholder('可以关闭此标签页');
+    }, 200);
+    return;
+  }
+
+  // iOS（Safari / Edge / Chrome / Firefox 一律）：先试一次 window.close()，
+  // Edge for iOS 的部分版本允许关掉从同应用跳转打开的页面。失败则占位页兜底。
+  let closed = false;
+  try {
+    closed = window.close();
+  } catch (_) { /* 忽略：iOS 浏览器会抛 SecurityError */ }
+  if (closed) return;
+
+  // 占位页 —— 让用户清楚「这条已经处理掉了」，不是空白页让人发愣
+  showDonePlaceholder('点浏览器右上角的「完成」或从底部上滑关闭');
+}
+
+function showDonePlaceholder(hint) {
+  document.documentElement.dataset.done = '1';
+  document.body.innerHTML =
+    '<div style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center;' +
+    'flex-direction:column;background:var(--bg);color:var(--fg);' +
+    'font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:32px;text-align:center">' +
+    '<div style="font-size:48px;margin-bottom:16px">✓</div>' +
+    '<div style="font-size:17px;font-weight:600;margin-bottom:8px">已提交决策</div>' +
+    '<div style="font-size:13px;color:var(--muted);max-width:280px;line-height:1.6">' +
+    hint + '</div></div>';
 }
 
 function renderCard(item) {
