@@ -166,6 +166,143 @@ export function assessDeviceReadiness(states, slug) {
   };
 }
 
+// ── 「连不上 HA」的真因分类 ──────────────────────────────────────────────────
+//
+// 为什么必须单独做这件事
+// ----------------------
+// node 的 fetch（undici）把**所有**底层错误都压成同一句话：
+//
+//     TypeError: fetch failed
+//
+// 真因只藏在 `err.cause` 里，而 `err.message` 一个字都不提。于是无论
+// 「HA 没在跑」「协议对不上」「自签证书不受信」「DNS 挂了」，报出来全一样 ——
+// 排查时完全看不出方向，只能靠猜。
+//
+// 实测（2026-09-20）：HA 换成 HTTPS 之后，config 里还是 `http://localhost:8123`，
+// 网关每次推送都只报 `fetch failed`，而 `cause` 其实是
+// `UND_ERR_SOCKET other side closed` —— 服务端收到的是一段 TLS 握手，
+// 它按 HTTP 解析失败就关了连接。**四个字把「协议不匹配」藏了整整一轮排查。**
+//
+// 所以这里做两件事：
+//   1. 永远把 `cause` 带出来（哪怕分类不出来，也不能丢真因）；
+//   2. 主动去试**另一个 scheme**，用一个请求证明「HA 其实在哪个协议上」。
+
+/** 从 undici 的 `fetch failed` 里把真因抠出来（多层 cause 都要看）。 */
+export function rootCause(e) {
+  const bits = [];
+  let cur = e;
+  for (let i = 0; i < 4 && cur; i++) {
+    const code = cur.code ? String(cur.code) : '';
+    const msg = cur.message ? String(cur.message) : '';
+    const s = [code, msg].filter(Boolean).join(' ');
+    if (s && !bits.includes(s)) bits.push(s);
+    cur = cur.cause;
+  }
+  return bits.join(' ← ');
+}
+
+/** 证书类错误（自签不受信 / 过期 / 主机名对不上）。 */
+function isCertError(text) {
+  return /UNABLE_TO_VERIFY_LEAF_SIGNATURE|SELF_SIGNED_CERT|DEPTH_ZERO_SELF_SIGNED_CERT|CERT_HAS_EXPIRED|ERR_TLS_CERT_ALTNAME_INVALID|unable to verify|self.signed/i.test(
+    text,
+  );
+}
+
+/** 「服务端说的不是 HTTP」类错误：协议写反了。 */
+function isProtocolMismatch(text) {
+  return /UND_ERR_SOCKET|other side closed|Parse Error|Expected HTTP|ERR_SSL_WRONG_VERSION_NUMBER|wrong version number|ERR_EMPTY_RESPONSE|socket hang up|ECONNRESET/i.test(
+    text,
+  );
+}
+
+/**
+ * 一个请求就能问出「HA 到底在哪个协议上」。
+ *
+ * 任何 HTTP 响应（含 401）都算「通」—— 我们要判的是**协议与可达性**，
+ * 不是鉴权。所以故意不带令牌，免得把令牌问题混进来。
+ * TLS 失败则说明「这个 scheme 上确实有个 TLS 服务，只是证书没被信任」。
+ */
+async function schemeAnswers(base, timeoutMs) {
+  try {
+    await fetch(`${base}/api/`, { signal: AbortSignal.timeout(timeoutMs) });
+    return { answers: true, tls: false };
+  } catch (e) {
+    const text = rootCause(e);
+    if (isCertError(text)) return { answers: false, tls: true, text };
+    return { answers: false, tls: false, text };
+  }
+}
+
+/**
+ * 把「连不上 HA」翻译成一句能照做的话。
+ *
+ * 原则同 `explainUnreachable`：诊断的价值不在「报了什么错」，
+ * 而在「看完知道下一步做什么」。
+ */
+export async function diagnoseHaUnreachable(baseUrl, err, { timeoutMs = 2500 } = {}) {
+  const base = String(baseUrl || '').replace(/\/+$/, '');
+  const cause = rootCause(err);
+  let scheme = '';
+  try {
+    scheme = new URL(base).protocol.replace(':', '');
+  } catch { /* 地址本身不合法，下面会兜底 */ }
+
+  const other = scheme === 'https' ? 'http' : scheme === 'http' ? 'https' : '';
+  const otherBase = other ? base.replace(/^https?:/, `${other}:`) : '';
+
+  // ── 情况 1：端口上没人听 → HA 没在跑 ────────────────────────────────────
+  if (/ECONNREFUSED/i.test(cause)) {
+    return (
+      `连不上 HA：${base} 这个端口上没有进程在听。\n` +
+      `  → HA 没在跑，或者端口被改了。\n` +
+      `  → 看一眼：lsof -nP -iTCP:8123 -sTCP:LISTEN\n` +
+      `  （真因：${cause || err.message}）`
+    );
+  }
+
+  if (!otherBase) {
+    return `连不上 HA（${base}）。真因：${cause || err.message}`;
+  }
+
+  const alt = await schemeAnswers(otherBase, timeoutMs);
+
+  // ── 情况 2：另一个协议能通 → 协议写反了 ─────────────────────────────────
+  if (alt.answers) {
+    return (
+      `连不上 HA：协议不匹配。\n` +
+      `  · 配置里写的是 ${scheme}:// ，但 HA 实际在 ${other}:// 上（"${otherBase}/api/" 有响应）。\n` +
+      `  → 把 config.json 的 channels.ha.baseUrl 改成 ${otherBase}\n` +
+      `  （真因：${cause || err.message}）`
+    );
+  }
+
+  // ── 情况 3：https 通不了、原因是证书 → 自签证书没被信任 ──────────────────
+  if (scheme === 'https' && (isCertError(cause) || alt.tls)) {
+    return (
+      `连不上 HA：HTTPS 证书不受信任（自签）。\n` +
+      `  · node 的 fetch 默认只认系统根证书，自签 CA 必须显式告诉它。\n` +
+      `  → 给**网关进程**加环境变量：\n` +
+      `      NODE_EXTRA_CA_CERTS=/path/to/你的CA.pem\n` +
+      `    launchd 托管的就写进 plist 的 EnvironmentVariables，然后重启网关。\n` +
+      `  （真因：${cause || err.message}）`
+    );
+  }
+
+  // ── 情况 4：http 连不上、但 https 上是 TLS 服务 → 同「协议写反了」 ───────
+  //    这条会命中 curl 能过、node 不行的场景，所以放在证书分支之后。
+  if (scheme === 'http' && isProtocolMismatch(cause) && alt.tls) {
+    return (
+      `连不上 HA：协议不匹配（${base} 上的服务在说 TLS，不是 HTTP）。\n` +
+      `  → HA 已启用 HTTPS，把 baseUrl 改成 ${otherBase}\n` +
+      `  → 若改成 https 后报证书错误，再给网关加 NODE_EXTRA_CA_CERTS 指向自签 CA。\n` +
+      `  （真因：${cause || err.message}）`
+    );
+  }
+
+  // ── 兜底：至少把真因带出去，不退回「fetch failed」 ──────────────────────
+  return `连不上 HA（${base}）。真因：${cause || err.message}`;
+}
+
 /**
  * 把判定结果翻译成一条**可执行**的说明。
  *

@@ -62,6 +62,7 @@ import dgram from 'node:dgram';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { assessDeviceReadiness } from '../src/channels/device-readiness.mjs';
+import * as macAlert from '../src/core/mac-alert.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -71,6 +72,61 @@ const MDNS_PROBE = path.join(HERE, 'probe-mdns.py');
 const HA_CONFIG_YAML = path.join(os.homedir(), '.homeassistant', 'configuration.yaml');
 const LOG_DIR = path.join(ROOT, 'logs');
 const LOG_FILE = path.join(LOG_DIR, 'net-watch.log');
+
+// ── 修复熔断（2026-09-21 加）────────────────────────────────────────────
+// 背景：HA 换到 Python 3.14 的 venv 后，那个二进制没有 macOS「本地网络」权限，
+// 组播被内核静默丢弃 —— 「重启 HA 让它重新广播」这个修复动作**永远修不好**。
+// 于是 netwatch 变成每 120 秒重启一次 HA 的死循环（实测 40+ 次），顺带把
+// Python 3.14 退出时段错误的崩溃弹窗也一起刷出来。
+// 规则：连续 REPAIR_MAX_FAILS 次「重启后广播仍不可见」→ 进入冷却，
+//       冷却期内只记账告警 + 推通知，**绝不重启 HA**。
+const REPAIR_STATE_FILE = path.join(ROOT, 'data', 'net-repair-state.json');
+const REPAIR_MAX_FAILS = 3;
+const REPAIR_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
+function readRepairState() {
+  try {
+    const s = JSON.parse(fs.readFileSync(REPAIR_STATE_FILE, 'utf8'));
+    return { fails: Number(s.fails) || 0, cooldownUntil: Number(s.cooldownUntil) || 0, lastFailAt: s.lastFailAt || null };
+  } catch {
+    return { fails: 0, cooldownUntil: 0, lastFailAt: null };
+  }
+}
+
+function writeRepairState(st) {
+  try {
+    fs.mkdirSync(path.dirname(REPAIR_STATE_FILE), { recursive: true });
+    fs.writeFileSync(REPAIR_STATE_FILE, JSON.stringify(st, null, 2) + '\n');
+  } catch (e) {
+    appendLog(`熔断状态写盘失败（不影响体检）：${e.message}`);
+  }
+}
+
+/** 返回值 { allowed, reason } —— 冷却中或失败次数用尽就拒绝重启。 */
+function repairGate() {
+  const st = readRepairState();
+  const now = Date.now();
+  if (st.cooldownUntil && now < st.cooldownUntil) {
+    const mins = Math.round((st.cooldownUntil - now) / 60000);
+    return { allowed: false, reason: `连续 ${st.fails} 次重启都没能恢复广播，冷却中（剩 ${mins} 分钟）` };
+  }
+  return { allowed: true, reason: '' };
+}
+
+/** 重启后广播恢复 → 清零；仍然看不到 → 累加失败，达上限就进冷却。 */
+function settleRepair(ok) {
+  const st = readRepairState();
+  if (ok) {
+    writeRepairState({ fails: 0, cooldownUntil: 0, lastFailAt: null });
+    return;
+  }
+  const fails = st.fails + 1;
+  const cooldownUntil = fails >= REPAIR_MAX_FAILS ? Date.now() + REPAIR_COOLDOWN_MS : 0;
+  writeRepairState({ fails, cooldownUntil, lastFailAt: new Date().toISOString() });
+  if (cooldownUntil) {
+    appendLog(`⚠️ 连续 ${fails} 次重启后广播仍不可见 → 熔断生效，6 小时内不再自动重启 HA（多半是本地网络权限问题，重启解决不了）`);
+  }
+}
 
 // ── 输出小工具（与 verify-ha.mjs 保持一致的视觉语言）──────────────────────
 const C = {
@@ -471,6 +527,146 @@ async function collect() {
   };
 }
 
+// ── 设备掉线主动播报 ────────────────────────────────────────────────────────
+//
+// 这一节解决的是「**判出来了，但没人知道**」。
+//
+// netwatch 每 120 秒跑一次 --once，第 9 项体检早就判得对：
+// 「★ 手机上的 HA App 没在连（推送必 500）」。但它只会往 logs/net-watch.log
+// 追一行 —— 实测连续 20 多行、跨了 40 分钟，用户那边毫无感知，
+// 直到某条命令被拒才发现。
+//
+// 一个只会写日志的看门狗，和一个不存在的看门狗，对用户来说是一样的。
+// 所以这里把判定结果升级成**主动播报**：Mac 上横幅 + 提示音 + 激活宿主 App
+// （通道细节与「为什么不用弹框」见 src/core/mac-alert.mjs 的头部注释）。
+//
+// 三条规则，缺一不可：
+//   ① 状态跳变才喊（在线→掉线 喊一次，掉线→在线 喊一次）——
+//      每 120 秒喊一次会把人逼疯，喊到最后就是静音。
+//   ② 持续掉线按 RENOTIFY_MS 再喊（默认 15 分钟）—— 否则你出门一趟回来，
+//      屏幕上只剩一条早就被划走的老通知，等于没喊。
+//   ③ `reporting === null`（判不了）**不动状态、不告警** —— 那是信息不足，
+//      不是故障。把「判不了」当成「掉线」喊出去，就是狼来了；
+//      后面真掉线时那声喊就没人信了。
+//
+// 状态落盘到 data/device-presence.json：LaunchAgent 每次都是新进程，
+// 不落盘就没有「上一次是什么状态」可比。
+
+const DEVICE_STATE_FILE = path.join(ROOT, 'data', 'device-presence.json');
+const RENOTIFY_MINUTES = Math.max(1, Number(args['renotify-minutes'] || 15));
+const RENOTIFY_MS = RENOTIFY_MINUTES * 60_000;
+const NO_NOTIFY = args['no-notify'] === 'true';
+
+function readDeviceState() {
+  try {
+    const j = JSON.parse(fs.readFileSync(DEVICE_STATE_FILE, 'utf8'));
+    return j && typeof j === 'object' ? j : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeDeviceState(s) {
+  try {
+    fs.mkdirSync(path.dirname(DEVICE_STATE_FILE), { recursive: true });
+    fs.writeFileSync(DEVICE_STATE_FILE, JSON.stringify(s, null, 2));
+  } catch {
+    /* 状态写不进去只影响「下次是否能去重」，不该让体检失败 */
+  }
+}
+
+/**
+ * 是否要喊这一声。纯函数，导出给 test 用。
+ *
+ * @param {'online'|'offline'|null} prev 上一次记下的状态
+ * @param {boolean} offline              这一次判定的结果
+ * @param {number} lastAlertAt           上次喊的时间戳
+ * @param {number} now
+ * @returns {'alert'|'renotify'|'recover'|'silent'}
+ */
+export function presenceAction(prev, offline, lastAlertAt, now, renotifyMs = RENOTIFY_MS) {
+  const wasOffline = prev === 'offline';
+  if (offline) {
+    if (!wasOffline) return 'alert';
+    return now - (Number(lastAlertAt) || 0) >= renotifyMs ? 'renotify' : 'silent';
+  }
+  // 从掉线恢复过来 —— 这条同样重要：否则你会一直以为手表还是坏的，
+  // 白白绕开确认流程。
+  return wasOffline ? 'recover' : 'silent';
+}
+
+/**
+ * 播报设备状态。**永不抛** —— 提醒失败绝不能把体检本身带崩。
+ *
+ * 返回 `{ action, methods, errors }`，`action` 为 'silent' 时说明什么也没做。
+ */
+export function announceDevicePresence(readiness, { baseUrl = 'http://localhost:8123' } = {}) {
+  const st = readDeviceState();
+  const now = Date.now();
+  const offline = readiness.reporting === false;
+
+  // 判不了就什么都不做 —— 规则 ③。
+  if (readiness.reporting === null || readiness.reporting === undefined) {
+    return { action: 'unknown', methods: [], errors: [] };
+  }
+
+  const action = presenceAction(st.state, offline, st.lastAlertAt, now, RENOTIFY_MS);
+  if (action === 'silent') {
+    // 只在首次确认掉线时补一次「since」，让「已经掉了多久」可查。
+    if (offline && !st.since) writeDeviceState({ ...st, state: 'offline', since: now });
+    return { action: 'silent', methods: [], errors: [] };
+  }
+
+  if (NO_NOTIFY) {
+    writeDeviceState({
+      state: offline ? 'offline' : 'online',
+      since: offline ? (st.since || now) : null,
+      lastAlertAt: now,
+      lastAction: `${action}:suppressed`,
+      lastReason: readiness.reason,
+    });
+    return { action: `${action}:suppressed`, methods: [], errors: [] };
+  }
+
+  let out;
+  if (action === 'recover') {
+    out = macAlert.notify({
+      title: '✅ 腕上确认已恢复',
+      subtitle: 'iPhone 上的 HA App 连回来了',
+      body: '推送通道重新注册成功，手表确认可以正常用了。',
+      level: 'normal',
+      repeat: 1,
+    });
+    appendLog('设备恢复：HA App 已重新在连，推送通道可用');
+  } else {
+    const mins = st.since ? Math.round((now - st.since) / 60000) : 0;
+    out = macAlert.notify({
+      title: action === 'renotify' ? '⏰ 腕上确认仍然不可用' : '⚠️ 腕上确认不可用',
+      subtitle: 'iPhone 上的 HA App 没在连（推送必 500）',
+      body:
+        (mins > 0 ? `已持续 ${mins} 分钟。` : '') +
+        '所有 L2/L3 命令都会 fail-closed 被拒。修法：把 iPhone 连回与 Mac 同一网段，' +
+        '打开 HA App 确认它指向 http://<本机名>.local:8123，连上后推送通道会自动注册。',
+      level: 'loud',
+    });
+    appendLog(
+      `设备掉线播报（${action}）：${out.methods.join('+') || '喊不出去'}｜${readiness.reason || ''}`
+    );
+  }
+
+  writeDeviceState({
+    state: offline ? 'offline' : 'online',
+    since: offline ? (st.since || now) : null,
+    lastAlertAt: now,
+    lastAction: action,
+    lastReason: readiness.reason || null,
+    lastMethods: out.methods,
+    lastErrors: out.errors,
+  });
+
+  return { action, methods: out.methods, errors: out.errors };
+}
+
 // ── 修复：让 HA 按当前地址重新广播 ────────────────────────────────────────
 //
 // ⚠️ 这里踩过一个**会把 HA 彻底弄停**的坑，必须写清楚：
@@ -679,18 +875,46 @@ async function main() {
   const hasBad = r.findings.some((f) => f.level === 'bad');
 
   if (QUIET) {
+    // ★ 设备在不在线 —— 每次都要播报一次（含「已恢复」）。
+    //
+    // 位置很关键：**必须在重启判断之前**。设备掉线时 `needsRebroadcast` 是
+    // false，如果把播报塞进下面的 else 分支，那么「掉线 → 恢复」这条路径上
+    // 恢复通知永远发不出来（恢复那一刻 needsRebroadcast 同样可能是 false，
+    // 而状态已经从 offline 变回 online，跳变检测只在这一次运行里成立，
+    // 错过就再没机会了）。
+    if (r.notifyService && r.readiness) {
+      try {
+        const a = announceDevicePresence(r.readiness, { baseUrl: r.baseUrl });
+        // 播报与否都不改判定结果 —— 体检的退出码只由 findings 决定。
+        void a;
+      } catch (e) {
+        // 提醒本身失败绝不该把体检带崩。记一行就够。
+        appendLog(`设备播报失败（不影响体检）：${e.message}`);
+      }
+    }
+
     // LaunchAgent 模式：平时一声不吭，只有出问题才说话并留日志。
     // ★ 重启的判据是 needsRebroadcast（广播本身不对），**不是 hasBad** ——
     //   拿 hasBad 触发过一次「每 120 秒重启 HA」的死循环，详见该函数注释。
     if (needsRebroadcast(r) && DO_REPAIR) {
+      // ★ 熔断闸门（2026-09-21）：修不好的根因（比如本地网络权限）会让
+      //   「重启 HA」变成每 120 秒一次的死循环，先问熔断再动手。
+      const gate = repairGate();
+      if (!gate.allowed) {
+        appendLog(`⚠️ 熔断：${gate.reason} → 本次不重启 HA（广播=${r.advertised.join(',') || '(无)'} 本机=${r.defIp}）`);
+        console.log(`[net-watch] ⚠️ ${gate.reason}，已停止自动重启 HA（详见 ${LOG_FILE}）`);
+        return 1;
+      }
       appendLog(`检测到地址漂移：广播=${r.advertised.join(',') || '(无)'} 本机=${r.defIp} → 触发修复`);
       const rep = await restartHa(r.baseUrl, loadHaCfg().token || '');
       appendLog(rep.ok ? '修复完成（HA 已重启并重新广播）' : `修复失败：${rep.reason}`);
       const after = await collect();
       if (needsRebroadcast(after)) {
+        settleRepair(false);
         console.log(`[net-watch] 地址漂移自动修复后仍未恢复：广播=${after.advertised.join(',') || '(无)'} 本机=${after.defIp}（详见 ${LOG_FILE}）`);
         return 1;
       }
+      settleRepair(true);
       appendLog(`修复后广播=${after.advertised.join(',') || '(无)'}`);
     } else if (hasBad) {
       // 体检有问题，但问题不在广播上 —— 只记账，绝不重启 HA。

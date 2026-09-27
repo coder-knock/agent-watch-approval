@@ -597,9 +597,12 @@ async function link() {
   console.log(C.bold('  ── 现在请照做，这一步只能在真机上验证 ──'));
   console.log(`  ${C.bold('1.')} 手机应该弹出通知。先别在手机上点。`);
   console.log(`  ${C.bold('2.')} 锁屏（或把手机屏幕扣下去），让通知镜像到 Apple Watch。`);
-  console.log(`  ${C.bold('3.')} 抬腕 → 在手表上找到这张卡片 → ` +
-              C.bold('在手表上') + ` 点「✅ 我在手表上按到了」。`);
-  console.log(`  ${C.dim('      手表上按钮若没出现，说明 Watch App 没装 —— 这是 Apple 的硬性要求。')}`);
+  console.log(`  ${C.bold('3.')} 抬腕看到卡片后，${C.bold('先别点卡片本体')} —— ` +
+              C.bold('旋转数码表冠把卡片滚到最底部') + `，`);
+  console.log(`      按钮就在最下面 → 点「✅ 我在手表上按到了」。`);
+  console.log(`  ${C.dim('      ⚠️ 点卡片本体 = 打开 HA App，不产生任何决策。')}` +
+              C.dim('按钮在长视图底部，滚表冠才出现 —— 这是 Apple 的设计，不是坏了。'));
+  console.log(`  ${C.dim('      手机上同理：长按卡片展开（锁屏右→左滑点「查看」；非锁屏时下拉）。')}`);
   console.log();
 
   // [5] 等事件回来
