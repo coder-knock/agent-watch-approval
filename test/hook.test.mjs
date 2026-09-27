@@ -20,6 +20,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { actionBinding } from '../src/core/bind.mjs';
 import { grantBinding, shortBinding } from '../src/core/local-grant.mjs';
+// 档位是这一整套断言的**输入**（默认策略按档位分叉），所以测试里直接复用
+// 真实的分类器去钉住命令的档位，而不是靠注释里手写的「这是 L2」。
+import { classify } from '../src/core/risk.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOOK = path.join(HERE, '..', 'bin', 'approve-hook.mjs');
@@ -207,61 +210,104 @@ console.log('\napprove-hook.mjs — 输出协议与降级行为\n');
 }
 
 // ── 4. 网关返回非 2xx ────────────────────────────────────────
-// ⚠️ 这一节在 2026-09-19 被**反向**改写过，原因值得记下来：
-// 原先断言「L2 → ask（回桌面弹窗，不耽误干活）」，而 SETUP.md 还建议
-// 头一周把 APPROVAL_FALLBACK_L3 也设成 ask。活体实测才发现：
-// **本构建的 WorkBuddy 不实现 ask** —— HookExecutor.parseHookOutput() 里
-// `allowed` 初值就是 `exitCode === 0`（true），只有 deny/allow 两个分支，
-// ask 直接落到初值 = 静默放行。于是「降级 ask」的真实效果是**把命令放过去**，
-// 而且比 allow 更不显眼。这就是用户看到的「推送失败…已按 deny 处理」背后的病灶。
-// 现在：fallback 默认 deny；显式配 ask 也会被降级成 deny 并在 stderr 警告。
+// ⚠️ 这一节被**反向**改写过两次，两次都值得留下来当教训：
+//
+// 第一次（2026-09-19）：把默认从 `L2: ask` 改成 `deny`。依据是
+// HookExecutor.parseHookOutput() 里 `allowed` 初值就是 `exitCode === 0`（true）、
+// 只有 deny/allow 两个分支，于是推断「ask = 静默放行」。
+//
+// 第二次（2026-09-20）：反读宿主实现后发现上面那个推断**只对 hook 层成立** ——
+// `ask` 会被 hasForcedAskDecision() 读到，使 canAutoApproveInBypassMode() /
+// canUseCachedApproval() 返回 false，也就是「禁止自动放行、交回宿主常规权限流程」。
+// 用户实测在那个流程里**确实会弹框**。于是又把默认改成了 `L2: ask`。
+//
+// 第三次（本节现状，也是最终结论）：**两边都是过度概括。**
+// `ask` 自己不改 `allowed`（所以它自己不拦），它只禁止自动放行；
+// 是否真的变成一个框，取决于**宿主原本会不会问你**：
+//   · 需要审批的场景（bypass 模式 / 有缓存批准 / 工具要批准）→ 会弹框；
+//   · 沙箱快速路径（`skipping 8-Phase permission check`）→ 宿主本来就不问人，
+//     ask 变不出框，命令照跑。
+//
+// 所以默认值回到 **deny**，理由不是「ask 没用」，而是
+// **deny 的行为不依赖权限模式**。而「降级也要用原本的方式询问」这件事，
+// 由 reason 里的 `[approval: action_required=ask_user]` 标记承担 ——
+// 交给 Agent 调 AskUserQuestion，那才是宿主原生、且不受模式影响的询问入口。
 {
-  console.log('\n[4] 网关返回非 2xx（fallback 必须 fail-closed）');
+  console.log('\n[4] 网关返回非 2xx（统一走降级策略）');
   mode = 'http500';
   const l2 = await runHook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'git push origin x' } });
-  check('L2 → deny（回归：曾经是 ask，而 ask 在这个构建里 = 放行）',
+  check('L2 → deny（默认；行为不依赖权限模式）',
     decisionOf(l2) === 'deny', `实际 ${decisionOf(l2)} — ${l2.out}`);
-  check('原因里带状态码与上游 error', /500/.test(l2.json?.hookSpecificOutput?.permissionDecisionReason || ''));
+  check('原因里带状态码与上游 error',
+    /500/.test(reasonOf(l2)), reasonOf(l2).slice(0, 160));
+  check('★ reason 第一行是 ask_user 标记（Agent 的循环靠这一行 grep）',
+    reasonOf(l2).split('\n')[0] === '[approval: action_required=ask_user]',
+    `第一行：${reasonOf(l2).split('\n')[0]}`);
+  check('★ 并给出「用原本的方式询问」的可执行下一步（AskUserQuestion + confirm + 重试）',
+    /AskUserQuestion/.test(reasonOf(l2)) && /approval confirm --yes/.test(reasonOf(l2))
+      && /重试/.test(reasonOf(l2)),
+    reasonOf(l2).slice(0, 300));
 
   const l3 = await runHook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'git push --force origin main' } });
-  check('L3 → 默认 fail-closed，deny', decisionOf(l3) === 'deny', l3.out);
+  check('L3 → deny（不可逆操作绝不在无人确认时跑掉）', decisionOf(l3) === 'deny', l3.out);
+  check('L3 也拿到同一套下一步（不是一句干拒）',
+    /AskUserQuestion/.test(reasonOf(l3)), reasonOf(l3).slice(0, 200));
 
+  // 显式设 ask 时应该真的是 ask —— 这个旋钮必须活着，否则「设了不生效」
+  // 就是 SETUP.md 记过的那个老毛病（FALLBACK 曾被硬编码绕过）。
   const l3ask = await runHook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'git push --force origin main' } },
     { APPROVAL_FALLBACK_L3: 'ask' });
-  check('L3 → 显式配成 ask 时**仍然 deny**（ask 在这个构建里等于放行，不能采用）',
-    decisionOf(l3ask) === 'deny', `实际 ${decisionOf(l3ask)} — ${l3ask.out}`);
-  check('并且在 stderr 说清为什么把 ask 降级了',
-    /不实现 ask/.test(l3ask.err), l3ask.err || '(stderr 为空)');
+  check('显式 APPROVAL_FALLBACK_L3=ask → 真的透出 ask（旋钮活着）',
+    decisionOf(l3ask) === 'ask', `实际 ${decisionOf(l3ask)} — ${l3ask.out}`);
+  check('★ 并且 stderr 提醒「ask 的效果取决于权限模式」（不硬拒，但要说清）',
+    /取决于权限模式/.test(l3ask.err), l3ask.err || '(stderr 为空)');
 
   // 反向锚点：allow 仍然是有效的显式选择 —— 否则 fallbackFor 就是「恒 deny」，
   // 上面那几条「因为它没生效」的失败会变得不可分辨。
   const l2allow = await runHook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'git push origin x' } },
     { APPROVAL_FALLBACK_L2: 'allow' });
-  check('L2 → 显式配成 allow 时确实放行（证明这个旋钮还活着，不是恒 deny）',
+  check('显式 APPROVAL_FALLBACK_L2=allow 时确实放行（证明这个旋钮还活着，不是恒 deny）',
     decisionOf(l2allow) === 'allow', `实际 ${decisionOf(l2allow)} — ${l2allow.out}`);
+
+  // 非法值必须回落，而且回落方向是**安全的那一侧**：deny。
+  const l2bad = await runHook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'git push origin x' } },
+    { APPROVAL_FALLBACK_L2: 'yolo' });
+  check('非法值回落 deny（回落方向取安全侧，不是 ask）',
+    decisionOf(l2bad) === 'deny', `实际 ${decisionOf(l2bad)} — ${l2bad.out}`);
+  check('并且 stderr 说清是哪个变量、哪个值不合法',
+    /APPROVAL_FALLBACK_L2=yolo/.test(l2bad.err), l2bad.err || '(stderr 为空)');
 }
 
 // ── 5. 网关不可达（fail-closed 的核心场景）──────────────────
-// 与上一节同一次修正：L2 原本断言 ask（= 放行），现在恒 deny。
-// 理由一样 —— 「确认没送到」必须是 fail-closed，而不是「当作批准」。
+// 这一节盯的是「三条降级路径共用同一套处置」。它们此前各写各的：
+// 「网关不可达」只丢一句原因，「推送失败」才有标记与下一步 —— 于是同一个
+// 原因会有两种表现，用户看到的「只有提醒，不能确认」就出在这。
+// 现在三条统一走 degradePolicyFor + degradeReasonLines。
 {
   console.log('\n[5] 网关不可达');
   const l2 = await runHook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'git push origin x' } },
     { APPROVAL_GATEWAY_URL: DEAD });
-  check('L2 → deny（回归：曾经是 ask = 静默放行）',
+  check('L2 → deny（不可达绝不等于同意）',
     decisionOf(l2) === 'deny', `实际 ${decisionOf(l2)} — ${l2.out}`);
-  check('原因写明网关地址', /不可达/.test(l2.json?.hookSpecificOutput?.permissionDecisionReason || ''),
-    l2.json?.hookSpecificOutput?.permissionDecisionReason);
+  check('原因写明网关地址（能看出是哪台网关断了）',
+    /不可达/.test(reasonOf(l2)) && new RegExp(DEAD.replace(/[/:.]/g, '\\$&')).test(reasonOf(l2)),
+    reasonOf(l2).slice(0, 200));
+  check('★ 同样带 ask_user 标记（与 §4 的网关非 2xx 表现一致，不再两副面孔）',
+    reasonOf(l2).split('\n')[0] === '[approval: action_required=ask_user]',
+    `第一行：${reasonOf(l2).split('\n')[0]}`);
+  check('★ 同样给出 AskUserQuestion 那条下一步',
+    /AskUserQuestion/.test(reasonOf(l2)), reasonOf(l2).slice(0, 260));
 
   const l3 = await runHook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'sudo rm -f /etc/hosts' } },
     { APPROVAL_GATEWAY_URL: DEAD });
   check('L3 → deny（不可逆操作绝不在无人确认时跑掉）', decisionOf(l3) === 'deny', l3.out);
 
-  const l3ask = await runHook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'sudo rm -f /etc/hosts' } },
-    { APPROVAL_GATEWAY_URL: DEAD, APPROVAL_FALLBACK_L3: 'ask' });
-  check('L3 → 显式 ask 仍然 deny，并且 stderr 说明原因',
-    decisionOf(l3ask) === 'deny' && /不实现 ask/.test(l3ask.err),
-    `实际 ${decisionOf(l3ask)}｜err=${l3ask.err || '(空)'}`);
+  // 显式把旋钮关掉的人应该拿到「纯 deny」—— 不带标记、不给下一步。
+  const l2plain = await runHook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'git push origin x' } },
+    { APPROVAL_GATEWAY_URL: DEAD, APPROVAL_PUSH_FAIL_POLICY: 'deny' });
+  check('policy=deny → 纯 deny，不带 ask_user 标记（显式选择被尊重）',
+    decisionOf(l2plain) === 'deny' && !/action_required=ask_user/.test(reasonOf(l2plain)),
+    reasonOf(l2plain).slice(0, 200));
 }
 
 // ── 6. 卡片推出去了但没点 ───────────────────────────────────
@@ -323,18 +369,24 @@ console.log('\napprove-hook.mjs — 输出协议与降级行为\n');
 
 // ── 9. 推送失败 → 拦住 → 本机一次性确认 → 只放行一次 ─────────
 // 用户的原话：「推送到手表失败…已按 deny 处理，这个处理不对，如果推送失败，
-// 请在 workbuddy 弹出选项供确认」。这一节就是那个诉求的回归测试。
+// 请在 workbuddy 弹出选项供确认」。这一节是那个诉求的回归测试。
 //
-// 为什么不是「hook 输出 ask 让宿主弹框」：本构建的 WorkBuddy 不实现 ask，
-// 输出 ask = 静默放行（见 §4/§5 的注释）。真正的弹框只能由 Agent 调
-// AskUserQuestion 来弹，本机一次性授权就是那次「允许这一次」的落点。
+// ⚠️ 这一节**显式把策略钉成 ask_user**（= 默认值），因为这里要测的是
+// 「拦下 + 本机一次性授权」这条兜底路径的完整性：
+// 拦住 → 写 blocked-last.json → reason 带 grep 标记与下一步 →
+// `approval confirm --yes` 签发 → 重试放行 → 一次性消费 →
+// 绑定必须一致 → 可收回。
+//
+// 为什么钉住而不是靠默认值：这一节的目的是「这条链路本身没坏」，
+// 用显式值可以让它与 §10 的「默认值是什么」解耦 —— 默认值将来再变，
+// 这里的失败应该只反映链路坏了，而不是「默认值又改了」。
 {
   console.log('\n[9] 推送失败 → 拦住 → 本机确认 → 放行一次');
   const DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'hook-pushfail-'));
   // 真实环境里 data/secret 由网关首次启动生成；approval confirm 靠它做 HMAC 签名，
   // 所以临时目录里也得有一份，否则测到的是「缺密钥时报错」而不是签发流程。
   fs.writeFileSync(path.join(DATA, 'secret'), 'f'.repeat(64));
-  const env = { APPROVAL_DATA_DIR: DATA };
+  const env = { APPROVAL_DATA_DIR: DATA, APPROVAL_PUSH_FAIL_POLICY: 'ask_user' };
   const CMD = 'git push origin x';
   // 用 grantBinding（只绑动作），与 hook 内部一致。
   // mock 网关回的那个 binding 是 actionBinding（覆盖整个 input）——两者**故意不同**，
@@ -346,7 +398,7 @@ console.log('\napprove-hook.mjs — 输出协议与降级行为\n');
 
   // ① 没有授权 → 必须拦住，而不是「当作批准」
   const first = await runHook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: CMD } }, env);
-  check('无授权时 → deny（旧行为是 ask，而 ask 在这个构建里等于放行）',
+  check('无授权时 → deny（策略钉为 deny 时的兜底语义：没送到 = 没同意）',
     decisionOf(first) === 'deny', `实际 ${decisionOf(first)} — ${first.out}`);
   check('原因说清是「推送到手表失败」', /推送到手表失败/.test(reasonOf(first)), reasonOf(first));
   check('原因里给出可执行的下一步（approval confirm）',
@@ -442,6 +494,160 @@ console.log('\napprove-hook.mjs — 输出协议与降级行为\n');
     decisionOf(otherDesc) === 'deny', `实际 ${decisionOf(otherDesc)}`);
 
   fs.rmSync(DATA, { recursive: true, force: true });
+}
+
+// ── 10. 推送失败时的处置策略（APPROVAL_PUSH_FAIL_POLICY）─────────────────────
+//
+// 这一节的存在理由：推送失败有**四条**可能的处置，而默认走哪条决定了
+// 用户体感是「只有提醒」还是「能用原本的方式问一次」。
+//
+// 关于 `ask` 的三种说法都出现过，最终结论（完整推理见 approve-hook.mjs 的
+// RAW_FALLBACK 注释）：
+//   · 「ask 会弹框」——只在需要审批的场景成立；
+//   · 「ask 等于放行」——只在沙箱快速路径上成立；
+//   · 「ask 的作用是禁止自动放行，交回宿主常规权限流程」——这句才是准确的，
+//     而**弹不弹框取决于宿主原本会不会问你**。
+// 所以 `ask` 是显式可选项，但**不是默认**：默认选行为不依赖模式的那条。
+//
+// ⚠️ 本节第一次写成「全绿」时踩过一个坑，值得留在这里：命令原本选了
+// `npm publish --access public`，而它被判成 **L3**（「发布到公共仓库，无法撤回」），
+// 于是「默认 → ask」永远不可能成立 —— 失败信息长得像实现坏了，其实是
+// 断言的前提错了。所以下面先用一行 `check` 把**命令的档位本身**钉住：
+// 档位是这条断言的输入，输入错了，后面全是噪声。
+//
+// 这一节同时是「设备掉线 vs 通道 500」在 reason 里能看出来的回归。
+{
+  console.log('\n[10] 推送失败时的处置策略');
+  auditPosts.length = 0;
+
+  const CMD = 'git push origin feature';
+  const CMD_L3 = 'npm publish --access public';
+
+  check('前提：CMD 确实是 L2',
+    classify('Bash', { command: CMD }).tier === 'L2',
+    `实际 ${classify('Bash', { command: CMD }).tier} — ${classify('Bash', { command: CMD }).why}`);
+  check('前提：CMD_L3 确实是 L3',
+    classify('Bash', { command: CMD_L3 }).tier === 'L3',
+    `实际 ${classify('Bash', { command: CMD_L3 }).tier} — ${classify('Bash', { command: CMD_L3 }).why}`);
+
+  // 10.1 默认（不设 policy）→ deny + ask_user 标记：拦住，但把「怎么继续」交回宿主
+  mode = 'pushfail';
+  const def = await runHook({
+    hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: CMD },
+  }, { APPROVAL_LOCAL_HANDOFF: '0' });
+  check('L2 默认 → deny（不赌权限模式）',
+    decisionOf(def) === 'deny', `decision=${decisionOf(def)} — ${def.out.slice(0, 200)}`);
+  check('★ reason 第一行是 ask_user 标记（默认就带，不需要额外配置）',
+    reasonOf(def).split('\n')[0] === '[approval: action_required=ask_user]',
+    `第一行：${reasonOf(def).split('\n')[0]}`);
+  check('reason 说清是「推送到手表失败」而不是别的降级路径',
+    /推送到手表失败/.test(reasonOf(def)), reasonOf(def).slice(0, 200));
+  check('reason 带上要执行的那条命令（Agent 转述给人时要引用它）',
+    reasonOf(def).includes(CMD), reasonOf(def).slice(0, 200));
+  check('★ reason 给出「用原本的方式询问」的两步（AskUserQuestion → confirm → 重试）',
+    /AskUserQuestion/.test(reasonOf(def)) && /approval confirm --yes/.test(reasonOf(def))
+      && /重试/.test(reasonOf(def)),
+    reasonOf(def).slice(0, 320));
+  check('默认策略不触发转场（没开 local 就不该开浏览器）',
+    !auditPosts.some((a) => a.event === 'local_handoff'),
+    JSON.stringify(auditPosts.map((a) => a.event)));
+  check('默认策略也不交回宿主（不发 handback_to_host）',
+    !auditPosts.some((a) => a.event === 'handback_to_host'),
+    JSON.stringify(auditPosts.map((a) => a.event)));
+
+  // 10.2 L3 默认 → 同样 deny + 同一套下一步
+  const l3 = await runHook({
+    hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: CMD_L3 },
+  }, { APPROVAL_LOCAL_HANDOFF: '0' });
+  check('L3 默认 → deny',
+    decisionOf(l3) === 'deny', `decision=${decisionOf(l3)} — ${l3.out.slice(0, 200)}`);
+  check('L3 的 reason 也给出下一步（AskUserQuestion + confirm），不是一句干拒',
+    /AskUserQuestion/.test(reasonOf(l3)) && /approval confirm/.test(reasonOf(l3)),
+    reasonOf(l3).slice(0, 200));
+
+  // 10.3 显式 policy=deny：连标记都不带，纯拦
+  const pinned = await runHook({
+    hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: CMD },
+  }, { APPROVAL_PUSH_FAIL_POLICY: 'deny' });
+  check('policy=deny 时 L2 也 deny', decisionOf(pinned) === 'deny', `decision=${decisionOf(pinned)}`);
+  check('policy=deny 时不带 ask_user 标记、也不给下一步（显式选择被尊重）',
+    !/action_required=ask_user/.test(reasonOf(pinned)) && !/AskUserQuestion/.test(reasonOf(pinned)),
+    reasonOf(pinned).slice(0, 200));
+
+  // 10.4 显式 policy=ask：真的透出 ask（交回宿主确认框）
+  const ask = await runHook({
+    hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: CMD },
+  }, { APPROVAL_PUSH_FAIL_POLICY: 'ask' });
+  check('policy=ask → permissionDecision=ask（显式开启时真的交回宿主）',
+    decisionOf(ask) === 'ask', `actual ${decisionOf(ask)}`);
+  check('policy=ask 时补了一条 handback_to_host 审计（否则这条路径对外不可见）',
+    auditPosts.some((a) => a.event === 'handback_to_host'),
+    JSON.stringify(auditPosts.map((a) => a.event)));
+  check('policy=ask 的 reason 说清「腕上确认没送到」',
+    /腕上确认没送到/.test(reasonOf(ask)), reasonOf(ask).slice(0, 160));
+
+  // 10.5 显式 policy=ask_user 与默认等价
+  auditPosts.length = 0;
+  const askUser = await runHook({
+    hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: CMD },
+  }, { APPROVAL_PUSH_FAIL_POLICY: 'ask_user' });
+  check('policy=ask_user 与默认行为一致（deny + 标记）',
+    decisionOf(askUser) === 'deny'
+      && reasonOf(askUser).split('\n')[0] === '[approval: action_required=ask_user]',
+    `decision=${decisionOf(askUser)}｜第一行=${reasonOf(askUser).split('\n')[0]}`);
+
+  // 10.6 policy=local 但转场被关掉 → 必须回到 deny（fail-closed 不能被绕过）
+  const localOff = await runHook({
+    hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: CMD },
+  }, { APPROVAL_PUSH_FAIL_POLICY: 'local', APPROVAL_LOCAL_HANDOFF: '0' });
+  check('policy=local 且转场关闭 → deny（不允许「转场不了就放行」）',
+    decisionOf(localOff) === 'deny', `decision=${decisionOf(localOff)}`);
+  check('★ 转场失败的原因写进了 reason，能查为什么没转成',
+    /未能转场到本机确认/.test(reasonOf(localOff)) && /APPROVAL_LOCAL_HANDOFF/.test(reasonOf(localOff)),
+    reasonOf(localOff).slice(0, 240));
+
+  // 10.6b policy=local 但页面探不通（mock 网关只有 JSON，不是 phone.html）
+  // → 同样必须 deny，而且**不许开浏览器**（先探再开的意义就在这里）。
+  auditPosts.length = 0;
+  const localUnreachable = await runHook({
+    hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: CMD },
+  }, { APPROVAL_PUSH_FAIL_POLICY: 'local' });
+  check('policy=local 但审批页探不通 → deny，且不开浏览器',
+    decisionOf(localUnreachable) === 'deny'
+      && !auditPosts.some((a) => a.event === 'local_handoff'),
+    `decision=${decisionOf(localUnreachable)}｜audit=${JSON.stringify(auditPosts.map((a) => a.event))}`);
+  check('并且 reason 里说明页面为什么不可用（不是含糊的「转场失败」）',
+    /未能转场到本机确认/.test(reasonOf(localUnreachable))
+      && /本地审批页不可用/.test(reasonOf(localUnreachable)),
+    reasonOf(localUnreachable).slice(0, 260));
+
+  // 10.7 非法 policy 值：回落到默认（ask_user），不是硬编码 deny
+  mode = 'pushfail';
+  const bad = await runHook({
+    hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: CMD },
+  }, { APPROVAL_PUSH_FAIL_POLICY: 'something_weird', APPROVAL_LOCAL_HANDOFF: '0' });
+  check('非法 policy 值回落到默认 ask_user（deny + 标记）',
+    decisionOf(bad) === 'deny'
+      && reasonOf(bad).split('\n')[0] === '[approval: action_required=ask_user]',
+    `decision=${decisionOf(bad)}｜第一行=${reasonOf(bad).split('\n')[0]}`);
+
+  // 10.8 policy 不影响正常 allow 路径
+  mode = 'allow';
+  const still = await runHook({
+    hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: CMD },
+  }, { APPROVAL_PUSH_FAIL_POLICY: 'ask_user' });
+  check('policy 不污染正常 allow 路径',
+    decisionOf(still) === 'allow' && !/action_required=ask_user/.test(reasonOf(still)),
+    `decision=${decisionOf(still)}`);
+
+  // 10.9 deviceOffline / pushFailureReason 缺失时 reason 仍可读
+  mode = 'pushfail';
+  const fallback = await runHook({
+    hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: CMD_L3 },
+  }, { APPROVAL_PUSH_FAIL_POLICY: 'ask_user' });
+  check('mock 网关没给 pushFailureReason 时 reason 仍可读',
+    /unknown|推送到手表失败/.test(reasonOf(fallback)),
+    reasonOf(fallback).slice(0, 200));
 }
 
 server.close();

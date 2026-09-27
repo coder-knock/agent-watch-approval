@@ -391,6 +391,77 @@ check('审计留痕：授予', ev8.includes('session_allow_granted'));
 check('审计留痕：命中', ev8.includes('session_allow_hit'));
 check('审计留痕：撤销', ev8.includes('session_allow_revoked'));
 
+// ── 9. 管理面板：/admin.html 与配套 API ────────────────────────────────────
+// 这一面给浏览器看，一面给 AI / 脚本看。共用「查询参数 → 服务端过滤」语义，
+// 避免前端再写一份。
+console.log('\n[9] 管理面板（admin.html + 过滤端点）');
+
+// 9.1 页面能 GET —— 直接 fetch 以拿到 content-type（api 助手只回 json）
+const adminPageRes = await fetch(BASE + '/admin.html');
+const adminPageBody = await adminPageRes.text();
+check('GET /admin.html 返回 200 + text/html',
+  adminPageRes.status === 200 && /text\/html/.test(adminPageRes.headers.get('content-type') || ''),
+  `status ${adminPageRes.status} ${adminPageRes.headers.get('content-type')}`);
+check('admin.html 含 /v1/approvals 与 /v1/audit/summary',
+  adminPageBody.includes('/v1/approvals') && adminPageBody.includes('/v1/audit/summary'),
+  'admin.html 缺少关键端点引用');
+
+// 9.2 过滤：tier / q / limit / offset
+const f1 = await api('/v1/approvals?tier=L2&q=rm&limit=3', undefined, 'GET');
+const f1AllL2 = (f1.json.items || []).every((i) => i.tier === 'L2');
+check('GET /v1/approvals?tier=L2&q=rm 只返回 L2',
+  f1.status === 200 && f1AllL2,
+  `status ${f1.status} mixed: ${!f1AllL2}`);
+
+const f2 = await api('/v1/approvals?limit=2', undefined, 'GET');
+check('GET /v1/approvals?limit=2 至少返回 2 条',
+  f2.json.items.length >= 2 && f2.json.limit === 2,
+  JSON.stringify({ len: f2.json.items.length, limit: f2.json.limit }));
+
+// 9.3 审计过滤：event / tier / since / id
+const f3 = await api('/v1/audit?event=created&limit=10', undefined, 'GET');
+const f3AllCreated = (f3.json.items || []).every((i) => i.event === 'created');
+check('GET /v1/audit?event=created 只返回 created 事件',
+  f3AllCreated, `mixed events found: ${(f3.json.items || []).slice(0, 3).map((i) => i.event).join(',')}`);
+
+// 9.4 限制裁剪
+const f4 = await api('/v1/audit?limit=99999', undefined, 'GET');
+check('GET /v1/audit?limit=99999 被夹到 500',
+  f4.json.limit === 500, JSON.stringify({ got: f4.json.limit }));
+
+// 9.5 坏时间戳：parseTs 返回 null，不过滤
+const f5 = await api('/v1/audit?since=not-a-date', undefined, 'GET');
+check('GET /v1/audit?since=not-a-date 不抛错、不过滤（fallback 全量）',
+  f5.status === 200 && Array.isArray(f5.json.items),
+  `status ${f5.status} ${JSON.stringify(f5.json).slice(0, 100)}`);
+
+// 9.6 summary：byEvent / byTier / byVerdict 三个维度
+const sum = await api('/v1/audit/summary', undefined, 'GET');
+check('GET /v1/audit/summary 含三个维度',
+  sum.json.byEvent && sum.json.byTier && sum.json.byVerdict && typeof sum.json.total === 'number',
+  JSON.stringify(Object.keys(sum.json || {})));
+
+// 9.7 trace：拉一条已知 id 的全部事件
+const traceId = f3.json.items[0]?.id;
+if (traceId) {
+  const trace = await api(`/v1/audit/trace/${traceId}`, undefined, 'GET');
+  check('GET /v1/audit/trace/:id 返回与 id 关联的事件',
+    trace.status === 200 && trace.json.items.every((e) => e.id === traceId),
+    `count=${trace.json.items.length} mismatch=${!trace.json.items.every((e) => e.id === traceId)}`);
+}
+
+// 9.8 详情端点：GET /v1/approvals/:id 仍按 id 走，没破坏
+// 用一个**已决定**的 id（section 3 里那条被拒的）来保证 verdict 不为 null。
+const decidedId = (await api('/v1/approvals?status=decided&limit=1', undefined, 'GET')).json.items[0]?.id;
+if (decidedId) {
+  const det = await api(`/v1/approvals/${decidedId}`, undefined, 'GET');
+  check('GET /v1/approvals/:id 仍能拿到完整记录',
+    det.status === 200 && det.json.id === decidedId && det.json.verdict,
+    `status ${det.status} id=${det.json?.id}`);
+} else {
+  check('GET /v1/approvals/:id 仍能拿到完整记录', false, 'no decided id available');
+}
+
 // ── 收尾 ────────────────────────────────────────────────────────────────────
 gw.kill('SIGTERM');
 await sleep(600);

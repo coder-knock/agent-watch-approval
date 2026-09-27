@@ -8,7 +8,7 @@
 //
 //   node test/ha-channel.test.mjs
 
-import { create, expandHint } from '../src/channels/ha.mjs';
+import { create, expandHint, describeForeignAction } from '../src/channels/ha.mjs';
 
 let pass = 0;
 let fail = 0;
@@ -116,13 +116,13 @@ console.log('\n[2] 通知报文形状');
   check('带 Authorization 头', svc.init.headers.Authorization === 'Bearer tok');
   check('title 取自记录', b.title === record.title);
   check(
-    '正文 = 原文 + 长按展开提示',
+    '正文 = 原文 + 展开提示',
     b.message === record.body + expandHint(record.options),
     JSON.stringify(b.message)
   );
   check(
     '提示里列出了全部按钮标签',
-    b.message.includes('长按这张卡片') && b.message.includes('拒绝') && b.message.includes('仅此一次')
+    b.message.includes('按钮在卡片底部') && b.message.includes('拒绝') && b.message.includes('仅此一次')
   );
   check(
     '允许/拒绝各带不同 SF Symbol 图标',
@@ -142,14 +142,21 @@ console.log('\n[2] 通知报文形状');
 }
 
 // ── 2b. 长按展开提示 ────────────────────────────────────────────────────────
-// 「HA 收到通知了，但手机上没有按钮可点」——iOS 不默认展示动作按钮，必须
-// **展开**才看得见，而 Apple 不给任何视觉线索。官方原文（actionable-notifications）：
-//   "All devices support notification expanding by performing a right to left swipe
-//    and pressing 'View' in the lock screen or pressing and holding. If you're not in
-//    the lock screen, you can also pull the notification down to expand it."
-// 即：锁屏上**从右往左滑**再点「查看」，或**长按**；不在锁屏时可以把通知**下拉**。
-// 正文里这一行是用户唯一的自救线索，所以要钉住它的形状。
-console.log('\n[2b] 长按展开提示');
+// 「HA 收到通知了，但通知上没有按钮可点」——iOS / watchOS **都不**默认展示动作
+// 按钮，必须**展开**才看得见，而 Apple 不给任何视觉线索。两边的官方原文：
+//   iPhone（actionable-notifications）：
+//     "All devices support notification expanding by performing a right to left swipe
+//      and pressing 'View' in the lock screen or pressing and holding. If you're not in
+//      the lock screen, you can also pull the notification down to expand it."
+//     → 锁屏上**从右往左滑**再点「查看」，或**长按**；不在锁屏时把通知**下拉**。
+//   Apple Watch（Apple Watch 使用手册「查看和响应通知」）：
+//     「旋转数码表冠以滚动到通知底部，然后轻点底部的一个按钮」
+//     → 按钮在长视图**底部**，要滚表冠才出现；点卡片本体只会**打开 App**。
+//
+// ⚠️ 这条 2026-09-20 被真机推翻过一次：原先这里（以及代码注释、INSTALL/SETUP/SKILL）
+// 都写着「watchOS 直接显示按钮」——错的，两边一样要展开，只是手势不同。
+// 正文里这一行是用户唯一的自救线索，所以要钉住它的形状，且必须覆盖两个平台。
+console.log('\n[2b] 展开提示（手机 + 手表）');
 
 {
   check(
@@ -159,8 +166,14 @@ console.log('\n[2b] 长按展开提示');
   );
 
   const h = expandHint([{ label: '拒绝' }, { label: '仅此一次' }, { label: '查看详情' }]);
-  check('多个按钮用「 / 」连接', h === '\n长按这张卡片 → 展开「拒绝 / 仅此一次 / 查看详情」', JSON.stringify(h));
+  check(
+    '多个按钮用「 / 」连接',
+    h === '\n按钮在卡片底部：手机长按展开，手表转表冠滚到底 → 「拒绝 / 仅此一次 / 查看详情」',
+    JSON.stringify(h)
+  );
   check('提示以换行开头（不和命令挤在同一行）', h.startsWith('\n'));
+  // 两个平台的手势必须都说到 —— 只说手机，手表上的人就会以为「没有按钮」。
+  check('提示同时覆盖手机与手表', h.includes('手机长按') && h.includes('手表转表冠'));
 
   // 真实 L3 预设：拒绝 / 仅此一次 / 查看详情 —— 三种 verdict 各一个图标
   const calls = stubFetch();
@@ -176,7 +189,37 @@ console.log('\n[2b] 长按展开提示');
   const acts = serviceCall(calls).body.data.actions;
   check('「查看详情」用 info 图标', acts[2].icon === 'sfsymbols:info.circle', JSON.stringify(acts.map((x) => x.icon)));
   check('三个按钮的图标互不相同', new Set(acts.map((x) => x.icon)).size === 3, JSON.stringify(acts.map((x) => x.icon)));
-  check('L3 正文也带长按提示', serviceCall(calls).body.message.includes('长按这张卡片'));
+  check('L3 正文也带展开提示', serviceCall(calls).body.message.includes('按钮在卡片底部'));
+}
+
+// ── 2b-2. 「点了通知却没产生决策」必须说出来 ─────────────────────────────────
+// gateway 对非 `APR:` 的 action 统一返回 `{ ok: true, ignored: … }` —— 一条
+// **没有信息量的成功返回**。而「点了通知主体」产生的
+// `UNNotificationDefaultActionIdentifier` 恰好落在这个分支里，于是用户那句
+// 「我点过了」被静默丢弃，事后完全无从查证（同一个模式在 `fetch failed` 上已经
+// 踩过一次：错误被压掉，只剩形式上的成功）。
+//
+// 这两个字面量是 Apple 定的，必须**逐字**匹配 —— 拼错就退化成「不认识」，
+// 于是这个测试的真正价值是钉住拼写。
+console.log('\n[2b-2] 通知落点的翻译');
+
+{
+  const d = describeForeignAction('com.apple.UNNotificationDefaultActionIdentifier');
+  check('认出「点了通知主体」', d.includes('点了通知主体') && d.includes('没有产生任何决策'), d);
+  check('并指出两个平台的正确手势', d.includes('长按') && d.includes('表冠'), d);
+  // 这段文字直接进 console —— 混进 Markdown 星号就会原样打出来。
+  check('不含 Markdown 标记（它要进终端）', !d.includes('**') && !d.includes('`'), d);
+
+  const x = describeForeignAction('com.apple.UNNotificationDismissActionIdentifier');
+  check('认出「忽略 / 划掉通知」', x.includes('忽略') && x.includes('没有产生任何决策'), x);
+
+  const o = describeForeignAction('APR:abc:allow:1:2');
+  check('不认识的动作如实说明、不硬猜', o.includes('不是本网关签发'), o);
+  check(
+    '空值不抛异常',
+    typeof describeForeignAction() === 'string' && typeof describeForeignAction(null) === 'string'
+  );
+  check('三个分支互不相同', new Set([d, x, o]).size === 3);
 }
 
 // ── 2c. 点通知直达审批页（url） ────────────────────────────────────────────
@@ -309,6 +352,122 @@ console.log('\n[5] 未配置令牌时如实降级');
   await ch.start();          // 不应建立连接
   check('令牌是占位符时 start() 不连、也不抛错', ch.connected === false);
   check('令牌是占位符时不发任何请求', calls.length === 0);
+}
+
+// ── 6. 设备掉线时不许白推（「总是卡死两分钟」的护栏） ──────────────────────
+//
+// 这一节钉的是 2026-09-20 查明的最深那条根因：
+// HA 的本地推送**在设备掉线时照样回 200**（它只负责把消息交给推送服务，
+// 不保证送达）。于是 push() 记 `pushOk: true` → 上层以为「卡片在路上」
+// → 老老实实等满 TTL → 最后只留一句「120s 内未收到确认，按默认拒绝」。
+// 用户体感就是「总是卡死」，而且翻审计也查不出原因。
+//
+// 现在 push() 在推之前先看设备在不在连；确认掉线就直接返回 ok:false，
+// 交给上层的「快失败」分支（0.02 秒返回 + 一句能指路的诊断）。
+console.log('\n[6] 设备掉线时不许白推');
+
+/** 一份 /api/states：device `demo` 的四条存活传感器。
+ *  value 传 null 表示「实体存在但没有值」= App 没在连。 */
+function statesFixture(value) {
+  const map = {
+    app_version: '2025.9.1',
+    battery_level: '82',
+    battery_state: 'Charging',
+    last_update_trigger: 'signaled',
+  };
+  return JSON.stringify(Object.keys(map).map((k) => ({
+    entity_id: `sensor.demo_${k}`,
+    state: value === null ? 'unavailable' : map[k],
+  })));
+}
+
+/** 按调用次序返回不同的 /api/states —— 用来模拟「缓存比现实旧」。
+ *  ⚠️ 必须同时实现 `text()` 与 `json()`：probeReadiness 走的是 `res.json()`，
+ *  而 notify 那条路径读 `res.text()`。少一个就会静默退化成「判不了设备状态」。 */
+function stubStatesSeq(seq) {
+  const calls = [];
+  let i = 0;
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), init, body: init.body ? JSON.parse(init.body) : null });
+    const u = String(url);
+    let text = '';
+    if (u.includes('/api/states')) {
+      text = seq[Math.min(i, seq.length - 1)];
+      i += 1;
+    }
+    return {
+      ok: true,
+      status: 200,
+      text: async () => text,
+      json: async () => JSON.parse(text || 'null'),
+    };
+  };
+  return calls;
+}
+
+const OFF = statesFixture(null);
+const ON = statesFixture('online');
+
+{
+  // ① 确认掉线：一次 notify 都不该发
+  const calls = stubStatesSeq([OFF]);
+  const res = await mk().push(record);
+  check('设备掉线时 push() 返回 ok:false', res.ok === false, JSON.stringify(res));
+  check('返回里标明 deviceOffline（便于上层与审计区分）', res.deviceOffline === true, JSON.stringify(res));
+  check('诊断里写清「App 没在连」，不是含糊的 500', /没在连/.test(res.detail || ''), res.detail);
+  check('★ 掉线时压根不调 notify（否则又是一次 200 假象）',
+    calls.filter((c) => c.url.includes('/api/services/')).length === 0,
+    JSON.stringify(calls.map((c) => c.url)));
+  check('掉线时探两次（缓存一次 + 强制复核一次）',
+    calls.filter((c) => c.url.includes('/api/states')).length === 2,
+    String(calls.filter((c) => c.url.includes('/api/states')).length));
+}
+
+{
+  // ② 设备在线：照常推
+  const calls = stubStatesSeq([ON]);
+  const res = await mk().push(record);
+  check('设备在线时照常推送，ok:true', res.ok === true, JSON.stringify(res));
+  check('设备在线时确实发了一次 notify',
+    calls.filter((c) => c.url.includes('/api/services/')).length === 1);
+}
+
+{
+  // ③ 判不了（设备没注册 / 实体被禁用）时必须放行等待，不许拦人
+  const calls = stubStatesSeq(['[]']);
+  const res = await mk().push(record);
+  check('判不了设备状态时不拦（宁可等，也不误拒）', res.ok === true, JSON.stringify(res));
+  check('判不了时照常发 notify',
+    calls.filter((c) => c.url.includes('/api/services/')).length === 1);
+}
+
+{
+  // ④ ★ 推送成功不许反过来把「真探测」覆盖成「在线」
+  //    次序：①缓存探测=掉线 ②强制复核=在线 ③之后的 readiness()=掉线
+  const calls = stubStatesSeq([OFF, ON, OFF]);
+  const ch = mk();
+  const res = await ch.push(record);
+  check('缓存说掉线但复核说在线 → 不误拦，照常推', res.ok === true, JSON.stringify(res));
+  check('复核说在线时确实发了 notify',
+    calls.filter((c) => c.url.includes('/api/services/')).length === 1);
+
+  const after = await ch.readiness();
+  check('★ 推送成功后缓存被作废，readiness() 重新问 HA（不撒谎报在线）',
+    after.reporting === false, JSON.stringify(after));
+  check('readiness() 确实又探了一次，不是拿缓存顶',
+    calls.filter((c) => c.url.includes('/api/states')).length === 3,
+    String(calls.filter((c) => c.url.includes('/api/states')).length));
+}
+
+{
+  // ⑤ 自动补推的可辨识性：被划走又回来时，得让人看出来是同一件事
+  const calls = stubStatesSeq([ON]);
+  await mk().push({ ...record, renotify: 2 });
+  const s = serviceCall(calls);
+  check('补推标题标出次数（让你认出「划掉的那张回来了」）',
+    s.body.title === 'Agent 想重建产物目录（第 2 次提醒）', s.body.title);
+  check('补推仍用同一个 tag（是替换不是堆叠）',
+    s.body.data.tag === 'apr_muTEST0001', s.body.data.tag);
 }
 
 // ── 汇总 ───────────────────────────────────────────────────────────────────

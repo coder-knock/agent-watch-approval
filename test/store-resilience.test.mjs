@@ -120,10 +120,11 @@ console.log('\n§1 _persist：原子改名失败时退化为覆盖写，且不�
   const s = freshStore();
   s.create(mkRecord('r1'));
 
-  let copyCalled = 0;
-  const origCopy = fs.copyFileSync;
+  // 退化路径是**直接覆盖写 `pending.json`**（不是 copyFileSync(tmp→target)）。
+  // 所以这里不再去数某个 syscall 调了几次 —— 那是实现细节，换个写法就假红。
+  // 改成看结果：数据到底有没有落盘、那个没用的 .tmp 有没有被清掉。
+  // 判据是「写成功了吗」，而不是「用的是哪个函数」。
   const un1 = patchFs('renameSync', (from) => { throw eperm(from); });
-  const un2 = patchFs('copyFileSync', (a, b) => { copyCalled++; return origCopy(a, b); });
   const cap = captureStderr();
 
   let threw = null;
@@ -131,11 +132,35 @@ console.log('\n§1 _persist：原子改名失败时退化为覆盖写，且不�
     s.create(mkRecord('r2')); // create → _persist → 改名会失败
   } catch (e) { threw = e; }
 
-  cap.restore(); un1(); un2();
+  const afterFirst = cap.text;
+  let onDisk = null;
+  try { onDisk = JSON.parse(fs.readFileSync(s.pendingFile, 'utf8')); } catch { /* 读不到 → 下面断言会红 */ }
+  const tmpLeft = fs.existsSync(s.pendingFile + '.tmp');
+
+  // ★ 再 create 一次，专门验「只喊一次」——
+  // _persist 被 2 秒一次的 sweep 调着，重复告警会把日志刷成全是它
+  // （实测刷了 26 行里 26 行），真正有用的启动信息被埋掉。
+  let threw2 = null;
+  try { s.create(mkRecord('r3')); } catch (e) { threw2 = e; }
+  const afterSecond = cap.text;
+
+  cap.restore(); un1();
+
+  const warnsAfterFirst = (afterFirst.match(/原子改名不可用/g) || []).length;
+  const warnsAfterSecond = (afterSecond.match(/原子改名不可用/g) || []).length;
+
   check('★ 改名失败时不抛异常（这正是把网关弄死的那一步）', threw === null, threw && threw.message);
-  check('退化路径真的走了 copyFileSync', copyCalled > 0, `调用 ${copyCalled} 次`);
-  check('退化时喊了一声（不是静默吞掉）', cap.text.includes('原子改名失败'), cap.text.slice(0, 160));
+  check('★ 退化路径真的把数据落到了 pending.json（不是只吞掉异常）',
+    (onDisk?.records || []).some((r) => r.id === 'r2'),
+    JSON.stringify(onDisk).slice(0, 160));
+  check('退化路径顺手清掉了那个没用的 .tmp（它装的是旧内容，留着会被误读）',
+    tmpLeft === false, `存在：${tmpLeft}`);
+  check('退化时喊了一声（不是静默吞掉）', /原子改名不可用/.test(afterFirst), afterFirst.slice(0, 160));
   check('__persistFailures 被记账', s._persistFailures > 0, `实际 ${s._persistFailures}`);
+  check('★ 第一次失败时告警恰好一条（不重复喊）', warnsAfterFirst === 1, `实际 ${warnsAfterFirst} 条`);
+  check('★ 第二次 _persist 不再重复告警（刷屏回归：曾经 26 行里 26 行都是它）',
+    threw2 === null && warnsAfterSecond === warnsAfterFirst,
+    `第一次 ${warnsAfterFirst} 条 → 第二次 ${warnsAfterSecond} 条`);
   s.close();
 }
 
@@ -146,8 +171,18 @@ console.log('\n§2 _persist：两条路都失败，仍然不抛（内存里的�
   const s = freshStore();
   s.create(mkRecord('r1'));
 
+  // 「两条路都失败」现在指：tmp 写得进去、rename 不行、**直接覆盖写也不行**。
+  // ⚠️ 这里必须**按路径**分别打补丁。早先的版本是把 copyFileSync 打成必抛，
+  // 而退化路径早已换成 writeFileSync —— 补丁打在一个再也不会被调用的函数上，
+  // 于是这一段实际上什么都没测到（绿得毫无意义）。按路径判断才能真的命中。
+  const origWrite = fs.writeFileSync;
   const un1 = patchFs('renameSync', (from) => { throw eperm(from); });
-  const un2 = patchFs('copyFileSync', () => { const e = new Error('EACCES'); e.code = 'EACCES'; throw e; });
+  const un2 = patchFs('writeFileSync', (p, ...rest) => {
+    if (String(p).endsWith(path.basename(s.pendingFile))) {
+      const e = new Error('EACCES: permission denied'); e.code = 'EACCES'; throw e;
+    }
+    return origWrite(p, ...rest);
+  });
   const cap = captureStderr();
 
   let threw = null;
@@ -239,8 +274,17 @@ console.log('\n§7 ★ 回归：真实把网关弄死的那条调用链，现在
   s.create(rec);
 
   // 复现现场：sweep(定时器) → settle → _persist → renameSync EPERM
+  //
+  // 再狠一档：退化路径（直接覆盖写）也失败。现场其实只有 rename 一步，
+  // 但「连兜底都写不进去」才是真正的最坏情况 —— 它依然不许冒到定时器外面。
+  const origWrite = fs.writeFileSync;
   const un = patchFs('renameSync', (from) => { throw eperm(from); });
-  const un2 = patchFs('copyFileSync', () => { throw eperm('x'); });
+  const un2 = patchFs('writeFileSync', (p, ...rest) => {
+    if (String(p).endsWith(path.basename(s.pendingFile))) {
+      const e = new Error('EACCES: permission denied'); e.code = 'EACCES'; throw e;
+    }
+    return origWrite(p, ...rest);
+  });
   const cap = captureStderr();
 
   let threw = null;
